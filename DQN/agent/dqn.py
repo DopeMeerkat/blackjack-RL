@@ -1,11 +1,12 @@
 """Double DQN training step.
 
 Implements the core learning algorithm described in blackjack_rl_design.md §7
-and §15.3:
+and §15.3, extended with Rainbow's n-step returns:
 
-  Double DQN Bellman target (for playing-head transitions):
-    a* = argmax_a [Q_online(s', a) + illegal_mask(s', a)]
-    y  = r + γ * Q_target(s', a*)             (terminal: y = r)
+  Double DQN Bellman target (for playing-head transitions, n-step):
+    a* = argmax_a [Q_online(s_{t+n}, a) + illegal_mask(s_{t+n}, a)]
+    y  = R_n + γ^n * Q_target(s_{t+n}, a*)       (terminal: y = R_n)
+    R_n = Σ_{k=0..n-1} γ^k · r_{t+k}             (truncated at done)
 
   Bet-head transitions are one-step bandits (§15.4):
     y  = r    (done=True always; no next-state bootstrap)
@@ -18,6 +19,14 @@ Action masking in the Bellman target:
   Applied additively to Q-values before argmax/value-read.
   This prevents the bootstrap from selecting or evaluating illegal actions
   even when the target network is stale.
+
+N-step integration:
+  Play-head transitions are pushed through per-env :class:`NStepAccumulator`
+  instances via :meth:`DQNAgent.add_play_transition`.  The accumulator flushes
+  n-step transitions into the PER buffer.  Bet-head transitions bypass the
+  accumulator (:meth:`DQNAgent.add_bet_transition`) since they are terminal
+  bandits.  Because play-head ``done`` fires only at hand completion, the
+  bootstrap factor for non-terminal tails is always γ^n_step.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from agent.network import BlackjackNet
-from agent.replay import PrioritizedReplayBuffer
+from agent.replay import NStepAccumulator, PrioritizedReplayBuffer
 
 
 class DQNAgent:
@@ -58,6 +67,9 @@ class DQNAgent:
         self.batch_size   = train_config["batch_size"]
         self.grad_clip    = train_config.get("grad_clip", 10.0)
         self.obs_dim      = net_config.get("obs_dim", 28)
+        self.n_step       = int(train_config.get("n_step", 1))
+        # γ^n_step is the effective bootstrap discount for n-step targets.
+        self._gamma_n     = self.gamma ** self.n_step
 
         # Online and target networks
         self.online_net = BlackjackNet(net_config).to(device)
@@ -77,7 +89,70 @@ class DQNAgent:
             alpha=alpha,
         )
 
+        # Per-env n-step accumulators for play-head transitions (lazy-created).
+        self._nstep_accumulators: dict[int, NStepAccumulator] = {}
+
         self._train_steps = 0
+
+    # ------------------------------------------------------------------
+    # Replay insertion helpers (n-step for play head, direct for bet head)
+    # ------------------------------------------------------------------
+
+    def _accumulator(self, env_id: int) -> NStepAccumulator:
+        acc = self._nstep_accumulators.get(env_id)
+        if acc is None:
+            acc = NStepAccumulator(self.n_step, self.gamma)
+            self._nstep_accumulators[env_id] = acc
+        return acc
+
+    def add_play_transition(
+        self,
+        env_id: int,
+        obs: np.ndarray,
+        action: int,
+        reward: float,
+        next_obs: np.ndarray,
+        done: bool,
+        mask: np.ndarray,
+        next_mask: np.ndarray,
+    ) -> None:
+        """Push a single-step playing transition through the n-step accumulator.
+
+        The accumulator emits n-step transitions into the PER buffer when it
+        has collected ``n_step`` steps or on a terminal flush.
+        """
+        acc = self._accumulator(env_id)
+        flushed = acc.push(dict(
+            obs=obs, action=action, reward=reward, next_obs=next_obs,
+            done=done, mask=mask, next_mask=next_mask, head_id=0,
+        ))
+        for t in flushed:
+            self.replay.add(
+                obs=t["obs"],
+                action=t["action"],
+                reward=t["reward"],
+                next_obs=t["next_obs"],
+                done=t["done"],
+                mask=t["mask"],
+                next_mask=t["next_mask"],
+                head_id=t["head_id"],
+            )
+
+    def add_bet_transition(
+        self,
+        obs: np.ndarray,
+        action: int,
+        reward: float,
+        next_obs: np.ndarray,
+        mask: np.ndarray,
+        next_mask: np.ndarray,
+    ) -> None:
+        """Insert a one-step bandit transition for the bet head (always done)."""
+        self.replay.add(
+            obs=obs, action=action, reward=reward,
+            next_obs=next_obs, done=True,
+            mask=mask, next_mask=next_mask, head_id=1,
+        )
 
     # ------------------------------------------------------------------
     # Action selection (during environment rollout)
@@ -187,9 +262,9 @@ class DQNAgent:
                     1, a_star.unsqueeze(1)
                 ).squeeze(1)
 
-                # Bootstrap only for non-terminal transitions
+                # Bootstrap only for non-terminal transitions (n-step: γ^n)
                 not_done_f = (~p_dones).float()
-                q_targets = p_rewards + self.gamma * q_target_vals * not_done_f
+                q_targets = p_rewards + self._gamma_n * q_target_vals * not_done_f
 
             td_err_play = (q_targets - q_current).detach().cpu().numpy()
 

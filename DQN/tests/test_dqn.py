@@ -184,6 +184,107 @@ class TestPrioritizedReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
+# NStepAccumulator tests (Rainbow n-step returns)
+# ---------------------------------------------------------------------------
+
+class TestNStepAccumulator:
+    OBS_DIM = 28
+
+    def _t(self, reward=0.0, done=False, head_id=0):
+        return dict(
+            obs=np.zeros(self.OBS_DIM, dtype=np.float32),
+            action=0,
+            reward=reward,
+            next_obs=np.ones(self.OBS_DIM, dtype=np.float32) * reward,
+            done=done,
+            mask=np.array([True, True, False, False]),
+            next_mask=np.array([True, True, False, False]),
+            head_id=head_id,
+        )
+
+    def test_no_flush_before_n(self):
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=3, gamma=1.0)
+        assert acc.push(self._t(reward=1.0)) == []
+        assert acc.push(self._t(reward=2.0)) == []
+
+    def test_flush_at_n(self):
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=3, gamma=1.0)
+        acc.push(self._t(reward=1.0))
+        acc.push(self._t(reward=2.0))
+        out = acc.push(self._t(reward=4.0))
+        assert len(out) == 1
+        # gamma=1 → R = 1+2+4 = 7
+        assert out[0]["reward"] == pytest.approx(7.0)
+        assert out[0]["done"] is False
+        assert out[0]["n_step"] == 3
+
+    def test_discounted_sum(self):
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=3, gamma=0.5)
+        acc.push(self._t(reward=1.0))
+        acc.push(self._t(reward=2.0))
+        out = acc.push(self._t(reward=4.0))
+        # R = 1 + 0.5*2 + 0.25*4 = 1 + 1 + 1 = 3
+        assert out[0]["reward"] == pytest.approx(3.0)
+
+    def test_terminal_flushes_all(self):
+        """Done on the 2nd push with n=3 → flush 2 truncated transitions."""
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=3, gamma=1.0)
+        acc.push(self._t(reward=1.0))
+        out = acc.push(self._t(reward=10.0, done=True))
+        assert len(out) == 2
+        # First: R = 1 + 10 = 11, done=True, n=2
+        assert out[0]["reward"] == pytest.approx(11.0)
+        assert out[0]["done"] is True
+        assert out[0]["n_step"] == 2
+        # Second: R = 10, done=True, n=1
+        assert out[1]["reward"] == pytest.approx(10.0)
+        assert out[1]["done"] is True
+        assert out[1]["n_step"] == 1
+
+    def test_terminal_after_full_window(self):
+        """Push n items with last one done → one normal flush, then terminal tail."""
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=3, gamma=1.0)
+        acc.push(self._t(reward=1.0))
+        acc.push(self._t(reward=2.0))
+        # Third push triggers len==n flush AND has done=True.
+        out = acc.push(self._t(reward=5.0, done=True))
+        # Logic: done path flushes all. buf has 3 items; flush buf[0..3], buf[1..3], buf[2..3].
+        assert len(out) == 3
+        # All flushed entries should be done=True
+        assert all(t["done"] for t in out)
+        assert out[0]["reward"] == pytest.approx(1.0 + 2.0 + 5.0)
+        assert out[0]["n_step"] == 3
+        assert out[1]["reward"] == pytest.approx(2.0 + 5.0)
+        assert out[1]["n_step"] == 2
+        assert out[2]["reward"] == pytest.approx(5.0)
+        assert out[2]["n_step"] == 1
+
+    def test_buffer_cleared_after_terminal(self):
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=3, gamma=1.0)
+        acc.push(self._t(reward=1.0))
+        acc.push(self._t(reward=2.0, done=True))
+        assert len(acc) == 0
+        # Subsequent pushes should start a fresh window
+        out = acc.push(self._t(reward=3.0))
+        assert out == []
+
+    def test_n_step_one_passes_through(self):
+        """n_step=1 should flush every push as a single-step transition."""
+        from agent.replay import NStepAccumulator
+        acc = NStepAccumulator(n_step=1, gamma=0.99)
+        out = acc.push(self._t(reward=5.0))
+        assert len(out) == 1
+        assert out[0]["reward"] == pytest.approx(5.0)
+        assert out[0]["n_step"] == 1
+
+
+# ---------------------------------------------------------------------------
 # DQNAgent tests
 # ---------------------------------------------------------------------------
 

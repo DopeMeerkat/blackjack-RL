@@ -68,7 +68,7 @@ def net_config(cfg: dict) -> dict:
 def train_config(cfg: dict) -> dict:
     return {k: cfg[k] for k in (
         "gamma", "target_tau", "batch_size", "learning_rate",
-        "replay_alpha", "grad_clip",
+        "replay_alpha", "grad_clip", "n_step",
     ) if k in cfg}
 
 
@@ -267,9 +267,10 @@ def train(args: argparse.Namespace) -> DQNAgent:
         # --- Step all envs ---
         next_obs, next_masks, rewards, dones, infos = vec_env.step(actions)
 
-        # --- Store playing transitions in replay ---
+        # --- Store playing transitions (via n-step accumulator) ---
         for i in play_envs:
-            agent.replay.add(
+            agent.add_play_transition(
+                env_id=int(i),
                 obs=obs_arr[i].copy(),
                 action=int(actions[i]),
                 reward=float(rewards[i]),
@@ -277,7 +278,6 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 done=bool(dones[i]),
                 mask=masks_arr[i].copy(),
                 next_mask=next_masks[i].copy(),
-                head_id=0,
             )
 
         # --- Handle done envs ---
@@ -290,15 +290,13 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 # The reward is the total hand outcome (already scaled by
                 # the bet multiplier inside the environment).
                 dummy_mask = np.array([True, True, True, True], dtype=bool)
-                agent.replay.add(
+                agent.add_bet_transition(
                     obs=bet_obs[i],
                     action=int(bet_actions[i]),
                     reward=float(hand_reward_accum[i]),
                     next_obs=np.zeros(agent.obs_dim, dtype=np.float32),
-                    done=True,
                     mask=dummy_mask,
                     next_mask=dummy_mask,
-                    head_id=1,
                 )
 
                 reset_obs, reset_mask, _ = vec_env.reset_at(i)

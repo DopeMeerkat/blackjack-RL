@@ -69,7 +69,7 @@ def train_config(cfg: dict) -> dict:
     """Keys expected by DQNAgent."""
     return {k: cfg[k] for k in (
         "gamma", "target_tau", "batch_size", "learning_rate",
-        "replay_alpha", "grad_clip",
+        "replay_alpha", "grad_clip", "n_step",
     ) if k in cfg}
 
 
@@ -251,7 +251,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         # --- Step all envs ---
         next_obs, next_masks, rewards, dones, infos = vec_env.step(actions)
 
-        # --- Store playing transitions in replay ---
+        # --- Store playing transitions (via n-step accumulator) ---
         for i in play_envs:
             ob      = obs_arr[i].copy()
             next_ob = next_obs[i].copy()
@@ -259,7 +259,8 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 ob[25]      = 0.0
                 next_ob[25] = 0.0
 
-            agent.replay.add(
+            agent.add_play_transition(
+                env_id=int(i),
                 obs=ob,
                 action=int(actions[i]),
                 reward=float(rewards[i]),
@@ -267,7 +268,6 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 done=bool(dones[i]),
                 mask=masks_arr[i].copy(),
                 next_mask=next_masks[i].copy(),
-                head_id=0,
             )
 
         # --- Handle done envs (both BJ-immediate and normal) ---

@@ -1,1 +1,8 @@
 .vscode/
+DQN/outputs/
+DQN/activate.bat
+.claude/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo

@@ -1,0 +1,56 @@
+# All hyperparameters for the blackjack RL project.
+# Do not hard-code any of these values in training scripts — load this file instead.
+# See blackjack_rl_design.md §16 for the full reference.
+
+env:
+  num_decks: 6
+  # Reshuffle when cards_remaining / 52 < reshuffle_threshold
+  reshuffle_threshold: 1.5        # decks remaining that triggers reshuffle (= 78 cards)
+  dealer_stands_soft_17: true     # S17 rule
+  double_after_split: true          # DAS allowed
+  # Max total sub-hands from splitting (3 splits = 4 hands)
+  resplit_max_hands: 3
+  blackjack_payout: 1.5           # 3:2
+  surrender: false
+  # Insurance is hard-coded (not learned): take when true count >= threshold
+  insurance_tc_threshold: 3
+  num_envs: 64                    # parallel environments
+  bet_multipliers: [1, 2, 4, 8, 12]
+  true_count_clip: 5.0            # clip TC to [-5, +5] before normalizing
+  true_count_min_decks: 0.5       # floor for TC denominator (prevents div by ~0)
+
+state:
+  obs_dim: 28
+  playing_actions: 4              # hit=0, stand=1, double=2, split=3
+  bet_actions: 5                  # indices into bet_multipliers
+
+network:
+  trunk_hidden: 512
+  trunk_layers: 3
+  head_hidden: 256
+  noisy_sigma0: 0.3               # initial sigma for NoisyLinear layers
+
+training:
+  algorithm: double_dqn
+  optimizer: adam
+  learning_rate: 1.0e-4
+  batch_size: 2048
+  replay_buffer_size: 1_000_000
+  replay_alpha: 0.6                  # prioritization exponent
+  replay_beta_start: 0.4             # importance-sampling exponent (annealed to 1.0)
+  target_tau: 0.005                  # Polyak averaging coefficient
+  train_every_n_steps: 4             # gradient update frequency
+  warmup_transitions: 50000          # don't train until this many transitions are in the buffer
+  gamma: 1.0                         # discount within a hand (short horizon)
+  total_hands: 200_000_000           # joint training budget
+  total_hands_no_count: 20_000_000 
+  total_hands_with_count: 50_000_000
+
+eps_greedy:                       # used only for A/B comparison (Milestone 5)
+  eps_start: 1.0
+  eps_end: 0.05
+  eps_decay_steps: 500_000        # linear decay over this many env steps
+
+eval:
+  eval_every_n_hands: 1_000_000
+  eval_hands: 1_000_000

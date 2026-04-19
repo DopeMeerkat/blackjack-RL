@@ -61,7 +61,7 @@ def net_config(cfg: dict) -> dict:
     return {k: cfg[k] for k in (
         "obs_dim", "playing_actions", "bet_actions",
         "trunk_hidden", "trunk_layers",
-        "head_hidden", "noisy_sigma0",
+        "head_hidden", "noisy_sigma0", "dueling",
     ) if k in cfg}
 
 

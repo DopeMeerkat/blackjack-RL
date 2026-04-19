@@ -29,6 +29,7 @@ network:
   trunk_layers: 3
   head_hidden: 256
   noisy_sigma0: 0.3               # initial sigma for NoisyLinear layers
+  dueling: true                   # Rainbow: V(s) + A(s,a) − mean_a A(s,a) combination
 
 training:
   algorithm: double_dqn

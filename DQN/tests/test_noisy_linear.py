@@ -247,12 +247,15 @@ class TestBlackjackNet:
                 "Trunk should use standard Linear, not NoisyLinear"
 
     def test_heads_use_noisy_linear(self):
-        """Each head must contain exactly 2 NoisyLinear layers."""
+        """Each head must contain NoisyLinear layers (4 per dueling head: 2 per stream)."""
         from agent.noisy_linear import NoisyLinear
         net = self._make()
+        expected = 4 if net.dueling else 2
         for head in (net.play_head, net.bet_head):
             noisy_count = sum(1 for m in head.modules() if isinstance(m, NoisyLinear))
-            assert noisy_count == 2, f"Expected 2 NoisyLinear in head, got {noisy_count}"
+            assert noisy_count == expected, (
+                f"Expected {expected} NoisyLinear in head, got {noisy_count}"
+            )
 
     def test_parameter_count_reasonable(self):
         """Full-size net should have ~400K parameters (within an order of magnitude)."""

@@ -1,18 +1,21 @@
 """Blackjack DQN network: shared trunk + playing head + bet-sizing head.
 
-Architecture (blackjack_rl_design.md §6):
+Architecture (blackjack_rl_design.md §6, extended with Rainbow dueling heads):
 
   Trunk:
     Linear(28 → 256) → ReLU → Linear(256 → 256) → ReLU → Linear(256 → 256) → ReLU
 
-  Playing head (4 Q-values, one per play action):
-    NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 4)
+  Dueling playing head (V + A − mean(A)):
+    value_stream:     NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 1)
+    advantage_stream: NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 4)
+    Q(s,a) = V(s) + A(s,a) − mean_a A(s,a)
 
-  Bet-sizing head (5 Q-values, one per bet multiplier):
-    NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 5)
+  Dueling bet-sizing head:
+    value_stream:     NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 1)
+    advantage_stream: NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 5)
 
-The trunk uses standard Linear layers (no noise); only the heads are noisy.
-Total parameter count ≈ 400K.
+When `dueling=False` (debug toggle), each head collapses to the pre-Rainbow
+single-stream layout used by the baseline DQN.
 
 Usage:
   net = BlackjackNet(config)
@@ -38,6 +41,58 @@ _HEAD_HIDDEN    = 256
 _N_PLAY_ACTIONS = 4
 _N_BET_ACTIONS  = 5
 _NOISY_SIGMA0   = 0.5
+_DUELING        = True
+
+
+class _DuelingHead(nn.Module):
+    """Dueling head: value stream (scalar) + advantage stream (per-action)."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden: int,
+        n_actions: int,
+        sigma0: float,
+    ) -> None:
+        super().__init__()
+        self.n_actions = n_actions
+        self.value_stream = nn.Sequential(
+            NoisyLinear(in_features, hidden, sigma0),
+            nn.ReLU(),
+            NoisyLinear(hidden, 1, sigma0),
+        )
+        self.advantage_stream = nn.Sequential(
+            NoisyLinear(in_features, hidden, sigma0),
+            nn.ReLU(),
+            NoisyLinear(hidden, n_actions, sigma0),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        value     = self.value_stream(features)               # (B, 1)
+        advantage = self.advantage_stream(features)           # (B, n_actions)
+        # Q(s,a) = V(s) + A(s,a) − mean_a A(s,a)
+        return value + advantage - advantage.mean(dim=1, keepdim=True)
+
+
+class _VanillaHead(nn.Module):
+    """Pre-Rainbow single-stream head (for dueling=False debug mode)."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden: int,
+        n_actions: int,
+        sigma0: float,
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            NoisyLinear(in_features, hidden, sigma0),
+            nn.ReLU(),
+            NoisyLinear(hidden, n_actions, sigma0),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features)
 
 
 class BlackjackNet(nn.Module):
@@ -51,12 +106,14 @@ class BlackjackNet(nn.Module):
     def __init__(self, config: dict) -> None:
         super().__init__()
 
-        obs_dim   = config.get("obs_dim",        _OBS_DIM)
-        trunk_h   = config.get("trunk_hidden",   _TRUNK_HIDDEN)
-        head_h    = config.get("head_hidden",    _HEAD_HIDDEN)
+        obs_dim   = config.get("obs_dim",         _OBS_DIM)
+        trunk_h   = config.get("trunk_hidden",    _TRUNK_HIDDEN)
+        head_h    = config.get("head_hidden",     _HEAD_HIDDEN)
         n_play    = config.get("playing_actions", _N_PLAY_ACTIONS)
-        n_bet     = config.get("bet_actions",    _N_BET_ACTIONS)
-        sigma0    = config.get("noisy_sigma0",   _NOISY_SIGMA0)
+        n_bet     = config.get("bet_actions",     _N_BET_ACTIONS)
+        sigma0    = config.get("noisy_sigma0",    _NOISY_SIGMA0)
+        dueling   = bool(config.get("dueling",    _DUELING))
+        self.dueling = dueling
 
         # --- Trunk (standard Linear, no noise) ---
         self.trunk = nn.Sequential(
@@ -68,19 +125,9 @@ class BlackjackNet(nn.Module):
             nn.ReLU(),
         )
 
-        # --- Playing head (NoisyLinear) ---
-        self.play_head = nn.Sequential(
-            NoisyLinear(trunk_h, head_h, sigma0),
-            nn.ReLU(),
-            NoisyLinear(head_h, n_play, sigma0),
-        )
-
-        # --- Bet-sizing head (NoisyLinear) ---
-        self.bet_head = nn.Sequential(
-            NoisyLinear(trunk_h, head_h, sigma0),
-            nn.ReLU(),
-            NoisyLinear(head_h, n_bet, sigma0),
-        )
+        head_cls = _DuelingHead if dueling else _VanillaHead
+        self.play_head = head_cls(trunk_h, head_h, n_play, sigma0)
+        self.bet_head  = head_cls(trunk_h, head_h, n_bet,  sigma0)
 
     # ------------------------------------------------------------------
     # Forward

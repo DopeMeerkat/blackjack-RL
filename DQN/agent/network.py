@@ -1,36 +1,38 @@
-"""Blackjack DQN network: shared trunk + playing head + bet-sizing head.
+"""Blackjack Rainbow DQN network: shared trunk + dueling, distributional heads.
 
-Architecture (blackjack_rl_design.md §6, extended with Rainbow dueling heads):
+Architecture (blackjack_rl_design.md §6, extended with Rainbow):
 
-  Trunk:
+  Trunk (standard Linear, no noise):
     Linear(28 → 256) → ReLU → Linear(256 → 256) → ReLU → Linear(256 → 256) → ReLU
 
-  Dueling playing head (V + A − mean(A)):
-    value_stream:     NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 1)
-    advantage_stream: NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 4)
-    Q(s,a) = V(s) + A(s,a) − mean_a A(s,a)
+  Dueling, distributional (C51) playing head:
+    value_stream:     NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → n_atoms)
+    advantage_stream: NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → n_play · n_atoms)
+    logits(s,a,k) = V(s,k) + A(s,a,k) − mean_a A(s,a,k)
+    p(s,a,·)      = softmax_k(logits)
 
-  Dueling bet-sizing head:
-    value_stream:     NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 1)
-    advantage_stream: NoisyLinear(256 → 256) → ReLU → NoisyLinear(256 → 5)
+  Dueling, distributional bet-sizing head (n_bet outputs per atom, analogous).
 
-When `dueling=False` (debug toggle), each head collapses to the pre-Rainbow
-single-stream layout used by the baseline DQN.
+  Atom support z_k ∈ [V_min, V_max] (inclusive), evenly spaced, stored as a
+  buffer on the network.  Expected Q-value for action selection:
+    Q(s,a) = Σ_k z_k · p(s,a,k)
+
+When ``dueling=False`` (debug toggle), each head collapses to a single-stream
+distributional layout (no V/A split) that still outputs n_actions·n_atoms
+logits per sample.
 
 Usage:
   net = BlackjackNet(config)
-  net.reset_noise()                   # before each training forward
-  play_q, bet_q = net(obs)            # obs: (B, 28)
-
-  net.set_deterministic(True)         # for eval / Bellman target computation
-  play_q, bet_q = net(obs)
-  net.set_deterministic(False)        # restore stochastic mode
+  net.reset_noise()
+  play_q, bet_q   = net(obs)             # expected Q, shapes (B, 4) / (B, 5)
+  play_d, bet_d   = net.forward_dist(obs) # raw dists, shapes (B, 4, A) / (B, 5, A)
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from agent.noisy_linear import NoisyLinear
 
@@ -42,61 +44,74 @@ _N_PLAY_ACTIONS = 4
 _N_BET_ACTIONS  = 5
 _NOISY_SIGMA0   = 0.5
 _DUELING        = True
+_N_ATOMS        = 51
+_V_MIN          = -15.0
+_V_MAX          =  15.0
 
 
-class _DuelingHead(nn.Module):
-    """Dueling head: value stream (scalar) + advantage stream (per-action)."""
+class _DuelingDistHead(nn.Module):
+    """Dueling distributional head: V(s, k) + A(s, a, k) − mean_a A(s, a, k)."""
 
     def __init__(
         self,
         in_features: int,
         hidden: int,
         n_actions: int,
+        n_atoms: int,
         sigma0: float,
     ) -> None:
         super().__init__()
         self.n_actions = n_actions
+        self.n_atoms   = n_atoms
         self.value_stream = nn.Sequential(
             NoisyLinear(in_features, hidden, sigma0),
             nn.ReLU(),
-            NoisyLinear(hidden, 1, sigma0),
+            NoisyLinear(hidden, n_atoms, sigma0),
         )
         self.advantage_stream = nn.Sequential(
             NoisyLinear(in_features, hidden, sigma0),
             nn.ReLU(),
-            NoisyLinear(hidden, n_actions, sigma0),
+            NoisyLinear(hidden, n_actions * n_atoms, sigma0),
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        value     = self.value_stream(features)               # (B, 1)
-        advantage = self.advantage_stream(features)           # (B, n_actions)
-        # Q(s,a) = V(s) + A(s,a) − mean_a A(s,a)
-        return value + advantage - advantage.mean(dim=1, keepdim=True)
+        B = features.shape[0]
+        v = self.value_stream(features)                          # (B, n_atoms)
+        a = self.advantage_stream(features).view(
+            B, self.n_actions, self.n_atoms
+        )
+        logits = v.unsqueeze(1) + a - a.mean(dim=1, keepdim=True)
+        return F.softmax(logits, dim=-1)                         # (B, n_actions, n_atoms)
 
 
-class _VanillaHead(nn.Module):
-    """Pre-Rainbow single-stream head (for dueling=False debug mode)."""
+class _VanillaDistHead(nn.Module):
+    """Single-stream distributional head (dueling disabled)."""
 
     def __init__(
         self,
         in_features: int,
         hidden: int,
         n_actions: int,
+        n_atoms: int,
         sigma0: float,
     ) -> None:
         super().__init__()
+        self.n_actions = n_actions
+        self.n_atoms   = n_atoms
         self.net = nn.Sequential(
             NoisyLinear(in_features, hidden, sigma0),
             nn.ReLU(),
-            NoisyLinear(hidden, n_actions, sigma0),
+            NoisyLinear(hidden, n_actions * n_atoms, sigma0),
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.net(features)
+        B = features.shape[0]
+        logits = self.net(features).view(B, self.n_actions, self.n_atoms)
+        return F.softmax(logits, dim=-1)
 
 
 class BlackjackNet(nn.Module):
-    """Dual-head DQN network for blackjack with card counting.
+    """Dual-head Rainbow DQN network for blackjack with card counting.
 
     Args:
         config: dict with keys from configs/default.yaml (merged from
@@ -113,7 +128,23 @@ class BlackjackNet(nn.Module):
         n_bet     = config.get("bet_actions",     _N_BET_ACTIONS)
         sigma0    = config.get("noisy_sigma0",    _NOISY_SIGMA0)
         dueling   = bool(config.get("dueling",    _DUELING))
-        self.dueling = dueling
+        n_atoms   = int(config.get("n_atoms",     _N_ATOMS))
+        v_min     = float(config.get("v_min",     _V_MIN))
+        v_max     = float(config.get("v_max",     _V_MAX))
+
+        assert n_atoms >= 2, "n_atoms must be >= 2"
+        assert v_max > v_min, "v_max must be > v_min"
+
+        self.dueling  = dueling
+        self.n_atoms  = n_atoms
+        self.v_min    = v_min
+        self.v_max    = v_max
+        self.delta_z  = (v_max - v_min) / (n_atoms - 1)
+
+        # Atom support: z_k ∈ [v_min, v_max], evenly spaced. Buffer → moves with .to(device).
+        self.register_buffer(
+            "support", torch.linspace(v_min, v_max, n_atoms, dtype=torch.float32)
+        )
 
         # --- Trunk (standard Linear, no noise) ---
         self.trunk = nn.Sequential(
@@ -125,27 +156,39 @@ class BlackjackNet(nn.Module):
             nn.ReLU(),
         )
 
-        head_cls = _DuelingHead if dueling else _VanillaHead
-        self.play_head = head_cls(trunk_h, head_h, n_play, sigma0)
-        self.bet_head  = head_cls(trunk_h, head_h, n_bet,  sigma0)
+        head_cls = _DuelingDistHead if dueling else _VanillaDistHead
+        self.play_head = head_cls(trunk_h, head_h, n_play, n_atoms, sigma0)
+        self.bet_head  = head_cls(trunk_h, head_h, n_bet,  n_atoms, sigma0)
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
+    def forward_dist(
+        self, obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return raw action distributions.
+
+        Returns:
+            play_dist: (B, n_play, n_atoms) — softmax-normalised probabilities.
+            bet_dist:  (B, n_bet,  n_atoms).
+        """
+        features = self.trunk(obs)
+        return self.play_head(features), self.bet_head(features)
+
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (play_q, bet_q) for a batch of observations.
+        """Return expected Q-values E_z[p(s,a,·)] derived from the atom support.
 
         Args:
             obs: float32 tensor of shape (B, 28).
 
         Returns:
-            play_q: (B, 4) — Q-values for the four playing actions.
-            bet_q:  (B, 5) — Q-values for the five bet multipliers.
+            play_q: (B, 4) — expected Q-values over the four playing actions.
+            bet_q:  (B, 5) — expected Q-values over the five bet multipliers.
         """
-        features = self.trunk(obs)
-        play_q   = self.play_head(features)
-        bet_q    = self.bet_head(features)
+        play_dist, bet_dist = self.forward_dist(obs)
+        play_q = (play_dist * self.support).sum(dim=-1)
+        bet_q  = (bet_dist  * self.support).sum(dim=-1)
         return play_q, bet_q
 
     # ------------------------------------------------------------------
@@ -153,23 +196,13 @@ class BlackjackNet(nn.Module):
     # ------------------------------------------------------------------
 
     def reset_noise(self) -> None:
-        """Resample noise in all NoisyLinear layers.
-
-        Call once before each forward pass during training rollouts.
-        The same noise sample is used for both the action-selection query
-        and the Q-value computation in the training step.
-        """
+        """Resample noise in all NoisyLinear layers."""
         for m in self.modules():
             if isinstance(m, NoisyLinear):
                 m.reset_noise()
 
     def set_deterministic(self, val: bool) -> None:
-        """Toggle deterministic mode in all NoisyLinear layers.
-
-        True  → use mean weights (μ_W, μ_b) only; suitable for eval and
-                for the Bellman target computation in training.
-        False → use noisy weights (requires reset_noise() before use).
-        """
+        """Toggle deterministic mode in all NoisyLinear layers."""
         for m in self.modules():
             if isinstance(m, NoisyLinear):
                 m.set_deterministic(val)
@@ -184,15 +217,7 @@ class BlackjackNet(nn.Module):
         obs: torch.Tensor,
         masks: torch.Tensor,
     ) -> torch.Tensor:
-        """Greedy action selection with illegal-action masking.
-
-        Args:
-            obs:   (B, 28) float32 — observation batch.
-            masks: (B, 4)  bool   — True where action is legal.
-
-        Returns:
-            actions: (B,) long — argmax of masked Q-values.
-        """
+        """Greedy action selection with illegal-action masking (expected Q)."""
         play_q, _ = self.forward(obs)
         play_q = play_q.clone()
         play_q[~masks] = -1e9
@@ -200,13 +225,6 @@ class BlackjackNet(nn.Module):
 
     @torch.no_grad()
     def select_bet_actions(self, obs: torch.Tensor) -> torch.Tensor:
-        """Greedy bet-size selection (no masking — all bets are always legal).
-
-        Args:
-            obs: (B, 28) float32.
-
-        Returns:
-            actions: (B,) long — argmax of bet Q-values.
-        """
+        """Greedy bet-size selection (no masking — all bets are always legal)."""
         _, bet_q = self.forward(obs)
         return bet_q.argmax(dim=1)

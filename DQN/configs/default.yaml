@@ -30,6 +30,9 @@ network:
   head_hidden: 256
   noisy_sigma0: 0.3               # initial sigma for NoisyLinear layers
   dueling: true                   # Rainbow: V(s) + A(s,a) − mean_a A(s,a) combination
+  n_atoms: 51                     # C51: number of atoms in the value distribution
+  v_min: -15.0                    # C51: left edge of atom support
+  v_max:  15.0                    # C51: right edge of atom support
 
 training:
   algorithm: double_dqn

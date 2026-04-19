@@ -62,6 +62,7 @@ def net_config(cfg: dict) -> dict:
         "obs_dim", "playing_actions", "bet_actions",
         "trunk_hidden", "trunk_layers",
         "head_hidden", "noisy_sigma0", "dueling",
+        "n_atoms", "v_min", "v_max",
     ) if k in cfg}
 
 

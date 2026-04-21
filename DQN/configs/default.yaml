@@ -25,22 +25,22 @@ state:
   bet_actions: 5                  # indices into bet_multipliers
 
 network:
-  trunk_hidden: 512
+  trunk_hidden: 256
   trunk_layers: 3
   head_hidden: 256
   noisy_sigma0: 0.3               # initial sigma for NoisyLinear layers
   dueling: true                   # Rainbow: V(s) + A(s,a) − mean_a A(s,a) combination
   n_atoms: 51                     # C51: number of atoms in the value distribution
-  v_min: -15.0                    # C51: left edge of atom support
-  v_max:  15.0                    # C51: right edge of atom support
+  v_min: -5.0                   # C51: left edge of atom support
+  v_max:  5.0                   # C51: right edge of atom support
 
 training:
   algorithm: double_dqn
   optimizer: adam
-  learning_rate: 1.0e-4
-  batch_size: 2048
+  learning_rate: 6.25e-5
+  batch_size: 1024
   replay_buffer_size: 1_000_000
-  replay_alpha: 0.6                  # prioritization exponent
+  replay_alpha: 0.5                  # prioritization exponent
   replay_beta_start: 0.4             # importance-sampling exponent (annealed to 1.0)
   target_tau: 0.005                  # Polyak averaging coefficient
   train_every_n_steps: 4             # gradient update frequency

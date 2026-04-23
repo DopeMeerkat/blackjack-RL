@@ -25,14 +25,24 @@ state:
   bet_actions: 5                  # indices into bet_multipliers
 
 network:
+<<<<<<< Updated upstream
   trunk_hidden: 256
   trunk_layers: 3
+=======
+  trunk_hidden: 512
+  trunk_layers: 4
+>>>>>>> Stashed changes
   head_hidden: 256
   noisy_sigma0: 0.3               # initial sigma for NoisyLinear layers
   dueling: true                   # Rainbow: V(s) + A(s,a) − mean_a A(s,a) combination
   n_atoms: 51                     # C51: number of atoms in the value distribution
+<<<<<<< Updated upstream
   v_min: -5.0                   # C51: left edge of atom support
   v_max:  5.0                   # C51: right edge of atom support
+=======
+  v_min: -15.0                   # C51: left edge of atom support
+  v_max:  15.0                   # C51: right edge of atom support
+>>>>>>> Stashed changes
 
 training:
   algorithm: double_dqn
@@ -56,6 +66,7 @@ curriculum:
     - name: hit_stand
       hands: 5_000_000               # per-phase budget
       actions_allowed: [0, 1]        # hit=0, stand=1
+<<<<<<< Updated upstream
       zero_count: true
       bet_enabled: false
       min_ev: -0.03                  # must exceed before advancing (fraction of 1x bet)
@@ -71,6 +82,23 @@ curriculum:
       zero_count: true
       bet_enabled: false
       min_ev: -0.01
+=======
+      zero_count: False
+      bet_enabled: false
+      min_ev: -0.04                 # must exceed before advancing (fraction of 1x bet)
+    - name: doubles
+      hands: 10_000_000
+      actions_allowed: [0, 1, 2]     # adds double=2
+      zero_count: False
+      bet_enabled: false
+      min_ev: -0.03
+    - name: splits
+      hands: 10_000_000
+      actions_allowed: [0, 1, 2, 3]  # adds split=3
+      zero_count: False
+      bet_enabled: false
+      min_ev: -0.02
+>>>>>>> Stashed changes
     - name: full_game
       hands: 170_000_000
       actions_allowed: [0, 1, 2, 3]

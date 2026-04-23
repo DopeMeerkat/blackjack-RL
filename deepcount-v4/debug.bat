@@ -1,0 +1,5 @@
+call "E:\Miniconda3\Scripts\activate.bat" "E:\Miniconda3\envs\rl_proj"
+
+python train.py --total_steps 50000 --rollout_steps 512 --batch_size 64 --n_epochs 4 --stage1_end 5000 --stage2_end 20000 --aux_anneal 30000 --flat_bet 10.0 --save_every 25000 --log_every 5 --seed 42
+
+cmd /k

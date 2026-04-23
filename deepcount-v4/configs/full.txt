@@ -1,0 +1,29 @@
+# configs/full.txt
+# Full training run as described in the design document.
+# ~4-8 h on CPU, ~1 h on GPU.
+#
+# Usage:
+#   python train.py $(cat configs/full.txt)
+
+--total_steps      2000000
+--rollout_steps    2048
+--batch_size       256
+--n_epochs         10
+--lr               3e-4
+--gamma            0.99
+--gae_lambda       0.95
+--clip_eps         0.2
+--ent_coef         0.01
+--vf_coef          0.5
+--max_grad_norm    0.5
+--target_kl        0.02
+--stage1_end       200000
+--stage2_end       1000000
+--aux_anneal       500000
+--flat_bet         10.0
+--d_shoe           64
+--d_hand           32
+--d_fused          128
+--save_every       100000
+--log_every        10
+--seed             42

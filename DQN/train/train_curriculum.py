@@ -64,21 +64,14 @@ def net_config(cfg: dict) -> dict:
         "obs_dim", "playing_actions", "bet_actions",
         "trunk_hidden", "trunk_layers",
         "head_hidden", "noisy_sigma0",
-<<<<<<< Updated upstream
-=======
         "dueling", "n_atoms", "v_min", "v_max",
->>>>>>> Stashed changes
     ) if k in cfg}
 
 
 def train_config(cfg: dict) -> dict:
     return {k: cfg[k] for k in (
         "gamma", "target_tau", "batch_size", "learning_rate",
-<<<<<<< Updated upstream
-        "replay_alpha", "grad_clip",
-=======
         "replay_alpha", "grad_clip", "n_step"
->>>>>>> Stashed changes
     ) if k in cfg}
 
 
@@ -251,11 +244,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
     train_every = cfg.get("train_every_n_steps", 4)
     beta_start = cfg.get("replay_beta_start", 0.4)
     eval_every = cfg.get("eval_every_n_hands", 1_000_000)
-<<<<<<< Updated upstream
-    eval_hands = min(cfg.get("eval_hands", 1_000_000), 100_000)
-=======
     eval_hands = cfg.get("eval_hands", 1_000_000)
->>>>>>> Stashed changes
     ckpt_every = cfg.get("eval_every_n_hands", 1_000_000)
     warmup_transitions = cfg.get("warmup_transitions", 100_000)
 

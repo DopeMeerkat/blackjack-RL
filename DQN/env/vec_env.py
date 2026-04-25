@@ -91,6 +91,22 @@ class VecBlackjackEnv:
         """Boolean array of shape (num_envs,) — True when env is in bet phase."""
         return np.array([env.in_bet_phase for env in self._envs], dtype=bool)
 
+    def get_rank_counts_batch(
+        self, indices: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Return remaining rank counts for a subset (or all) of environments.
+
+        Args:
+            indices: Optional 1-D integer array of env indices.  When None,
+                     returns counts for all environments.
+
+        Returns:
+            Array of shape (K, 10), dtype int32, where K = len(indices) or
+            num_envs when indices is None.
+        """
+        envs = self._envs if indices is None else [self._envs[i] for i in indices]
+        return np.stack([e.get_rank_counts() for e in envs]).astype(np.int32)
+
     def seed(self, seeds: list[int]) -> None:
         """Re-seed all environments."""
         for env, s in zip(self._envs, seeds):

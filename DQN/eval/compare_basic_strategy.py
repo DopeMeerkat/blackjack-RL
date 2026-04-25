@@ -189,7 +189,6 @@ def evaluate_action_agreement(
 
     true_count = 0.0          # neutral count for comparison
     decks_remaining = 3.0     # mid-shoe
-    bet_multiplier  = 1.0
 
     for dealer_rank, dealer_val in dealer_upcards:
         # Hard hands (usable_ace=False)
@@ -206,8 +205,6 @@ def evaluate_action_agreement(
                 can_split=can_split,
                 true_count=true_count,
                 decks_remaining=decks_remaining,
-                bet_multiplier=bet_multiplier,
-                bet_phase=False,
             )
             if zero_count:
                 obs[25] = 0.0
@@ -218,8 +215,7 @@ def evaluate_action_agreement(
             mask_t[0, 3] = can_split
 
             with torch.no_grad():
-                play_q, _ = net(obs_t)
-                play_q = play_q.clone()
+                play_q = net(obs_t).clone()
                 play_q[~mask_t] = -1e9
             agent_action = int(play_q.argmax(dim=1).item())
 
@@ -253,8 +249,6 @@ def evaluate_action_agreement(
                 can_split=False,
                 true_count=true_count,
                 decks_remaining=decks_remaining,
-                bet_multiplier=bet_multiplier,
-                bet_phase=False,
             )
             if zero_count:
                 obs[25] = 0.0
@@ -265,8 +259,7 @@ def evaluate_action_agreement(
             mask_t[0, 3] = False   # no split
 
             with torch.no_grad():
-                play_q, _ = net(obs_t)
-                play_q = play_q.clone()
+                play_q = net(obs_t).clone()
                 play_q[~mask_t] = -1e9
             agent_action = int(play_q.argmax(dim=1).item())
 
@@ -353,8 +346,7 @@ def make_agent_policy(
         obs_t  = torch.tensor(ob,         dtype=torch.float32, device=device)
         mask_t = torch.tensor(mask_batch,  dtype=torch.bool,    device=device)
         with torch.no_grad():
-            play_q, _ = net(obs_t)
-            play_q = play_q.clone()
+            play_q = net(obs_t).clone()
             play_q[~mask_t] = -1e9
         return play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
     return policy_fn

@@ -257,8 +257,6 @@ def check_deviation(
         can_split=dev["can_split"],
         true_count=test_tc,
         decks_remaining=decks_remaining,
-        bet_multiplier=1.0,
-        bet_phase=False,
     )
 
     # Build action mask
@@ -268,8 +266,7 @@ def check_deviation(
     mask_t = torch.tensor(mask[None], dtype=torch.bool, device=device)
 
     with torch.no_grad():
-        play_q, _ = net(obs_t)
-        play_q = play_q.clone()
+        play_q = net(obs_t).clone()
         play_q[~mask_t] = -1e9
 
     agent_action = int(play_q.argmax(dim=1).item())

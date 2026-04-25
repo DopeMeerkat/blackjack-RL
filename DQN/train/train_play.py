@@ -59,7 +59,7 @@ def load_config(path: str) -> dict:
 def net_config(cfg: dict) -> dict:
     """Keys expected by BlackjackNet."""
     return {k: cfg[k] for k in (
-        "obs_dim", "playing_actions", "bet_actions",
+        "obs_dim", "playing_actions",
         "trunk_hidden", "trunk_layers",
         "head_hidden", "noisy_sigma0", "dueling",
         "n_atoms", "v_min", "v_max",
@@ -130,8 +130,7 @@ def quick_eval(
             obs_t  = torch.tensor(batch_obs,      dtype=torch.float32, device=device)
             mask_t = torch.tensor(masks[play_idx], dtype=torch.bool,    device=device)
             with torch.no_grad():
-                play_q, _ = agent.online_net(obs_t)
-                play_q = play_q.clone()
+                play_q = agent.online_net(obs_t).clone()
                 play_q[~mask_t] = -1e9
             play_actions = play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
             actions[play_idx] = play_actions

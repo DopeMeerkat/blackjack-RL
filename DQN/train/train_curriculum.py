@@ -4,7 +4,7 @@ Phases (configured in configs/default.yaml under 'curriculum.phases'):
   1. hit_stand  – hit + stand only, count zeroed, flat 1x bet
   2. doubles    – adds doubling down, count zeroed, flat 1x bet
   3. splits     – full play action space, count zeroed, flat 1x bet
-  4. full_game  – all actions, true count enabled, bet head learned
+  4. full_game  – all actions, true count enabled, flat 1x bet
 
 Phase advancement requires both:
   (a) phase_hands >= phase.hands
@@ -62,7 +62,7 @@ def load_config(path: str) -> dict:
 
 def net_config(cfg: dict) -> dict:
     return {k: cfg[k] for k in (
-        "obs_dim", "playing_actions", "bet_actions",
+        "obs_dim", "playing_actions",
         "trunk_hidden", "trunk_layers",
         "head_hidden", "noisy_sigma0",
         "dueling", "n_atoms", "v_min", "v_max",
@@ -81,7 +81,6 @@ def train_config(cfg: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _ACTION_NAMES = ["hit", "stand", "double", "split"]
-_BET_MULTIPLIERS = [1, 2, 4, 8, 12]
 
 
 def actions_to_mask(actions_allowed: list[int]) -> np.ndarray:
@@ -117,12 +116,11 @@ def quick_eval(
 ) -> dict:
     """Evaluate under the constraints of the current curriculum phase.
 
-    Applies curriculum mask, count zeroing, and bet gating so the reported
-    EV is comparable to the phase's min_ev threshold.
+    Applies curriculum mask and count zeroing so the reported EV is
+    comparable to the phase's min_ev threshold.  Bet is always flat 1x.
     """
     curriculum_mask = actions_to_mask(phase["actions_allowed"])
     zero_count = phase["zero_count"]
-    bet_enabled = phase["bet_enabled"]
 
     agent.online_net.set_deterministic(True)
     vec_env = VecBlackjackEnv(
@@ -132,23 +130,10 @@ def quick_eval(
 
     rewards: list[float] = []
     action_counts = np.zeros(4, dtype=np.int64)
-    bet_counts = np.zeros(5, dtype=np.int64)
 
     while len(rewards) < n_hands:
         in_bet = vec_env.in_bet_phase
-        actions = np.zeros(num_envs, dtype=np.int32)
-
-        bet_idx = np.where(in_bet)[0]
-        if len(bet_idx) > 0 and bet_enabled:
-            batch_obs = obs[bet_idx].copy()
-            obs_t = torch.tensor(batch_obs, dtype=torch.float32, device=device)
-            with torch.no_grad():
-                _, bet_q = agent.online_net(obs_t)
-            bet_acts = bet_q.argmax(dim=1).cpu().numpy().astype(np.int32)
-            actions[bet_idx] = bet_acts
-            for a in bet_acts:
-                bet_counts[a] += 1
-        # else: flat 1x (actions[bet_idx] stay 0)
+        actions = np.zeros(num_envs, dtype=np.int32)  # bet envs: flat 1x (action=0)
 
         play_idx = np.where(~in_bet)[0]
         if len(play_idx) > 0:
@@ -159,8 +144,7 @@ def quick_eval(
             obs_t = torch.tensor(batch_obs, dtype=torch.float32, device=device)
             mask_t = torch.tensor(batch_masks, dtype=torch.bool, device=device)
             with torch.no_grad():
-                play_q, _ = agent.online_net(obs_t)
-                play_q = play_q.clone()
+                play_q = agent.online_net(obs_t).clone()
                 play_q[~mask_t] = -1e9
             play_acts = play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
             actions[play_idx] = play_acts
@@ -185,7 +169,6 @@ def quick_eval(
     return {
         "ev": ev,
         "action_counts": action_counts,
-        "bet_counts": bet_counts,
     }
 
 
@@ -256,13 +239,6 @@ def train(args: argparse.Namespace) -> DQNAgent:
     ckpt_every = cfg.get("eval_every_n_hands", 1_000_000)
     warmup_transitions = cfg.get("warmup_transitions", 100_000)
 
-    # Per-env accumulators for bet-head transitions
-    obs_dim = cfg.get("obs_dim", 28)
-    bet_obs = np.zeros((num_envs, obs_dim), dtype=np.float32)
-    bet_actions_arr = np.zeros(num_envs, dtype=np.int32)
-    hand_reward_accum = np.zeros(num_envs, dtype=np.float32)
-    dummy_mask = np.array([True, True, True, True], dtype=bool)
-
     # Curriculum state (resumed from checkpoint if present)
     if ckpt is not None:
         phase_idx = ckpt["phase_idx"]
@@ -284,9 +260,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         p = phases[idx]
         print(
             f"\n>>> Phase {idx}: {p['name']}  "
-            f"(actions={p['actions_allowed']}, "
-            f"zero_count={p['zero_count']}, "
-            f"bet_enabled={p['bet_enabled']})"
+            f"(actions={p['actions_allowed']}, zero_count={p['zero_count']})"
         )
         if writer:
             writer.add_scalar("train/curriculum_phase", idx, hp)
@@ -317,23 +291,11 @@ def train(args: argparse.Namespace) -> DQNAgent:
         phase = current_phase()
         curriculum_mask = actions_to_mask(phase["actions_allowed"])
         zero_count = phase["zero_count"]
-        bet_enabled = phase["bet_enabled"]
 
         in_bet = vec_env.in_bet_phase  # (N,) bool
 
         # --- Action selection ---
-        actions = np.zeros(num_envs, dtype=np.int32)
-
-        bet_envs = np.where(in_bet)[0]
-        if len(bet_envs) > 0:
-            if bet_enabled:
-                batch_obs = obs_arr[bet_envs].copy()
-                actions[bet_envs] = agent.select_bet_actions_batch(batch_obs)
-            # else: flat 1x (actions stay 0)
-            for i in bet_envs:
-                bet_obs[i] = obs_arr[i].copy()
-                bet_actions_arr[i] = actions[i]
-                hand_reward_accum[i] = 0.0
+        actions = np.zeros(num_envs, dtype=np.int32)  # bet envs: flat 1x (action=0)
 
         play_envs = np.where(~in_bet)[0]
         if len(play_envs) > 0:
@@ -365,7 +327,6 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 done=bool(dones[i]),
                 mask=effective_mask,
                 next_mask=effective_next_mask,
-                head_id=0,
             )
 
         # --- Handle done envs ---
@@ -373,25 +334,9 @@ def train(args: argparse.Namespace) -> DQNAgent:
             if dones[i]:
                 hands_played += 1
                 phase_hands += 1
-                hand_reward_accum[i] += rewards[i]
-
-                if bet_enabled:
-                    agent.replay.add(
-                        obs=bet_obs[i],
-                        action=int(bet_actions_arr[i]),
-                        reward=float(hand_reward_accum[i]),
-                        next_obs=np.zeros(obs_dim, dtype=np.float32),
-                        done=True,
-                        mask=dummy_mask,
-                        next_mask=dummy_mask,
-                        head_id=1,
-                    )
-
                 reset_obs, reset_mask, _ = vec_env.reset_at(i)
                 next_obs[i] = reset_obs
                 next_masks[i] = reset_mask
-            else:
-                hand_reward_accum[i] += rewards[i]
 
         obs_arr = next_obs
         masks_arr = next_masks
@@ -430,14 +375,6 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 f"rate={rate/1000:.1f}k/s\n"
                 f"    actions: {action_str}"
             )
-            if bet_enabled:
-                total_bets = stats["bet_counts"].sum()
-                bet_pcts = stats["bet_counts"] / max(total_bets, 1)
-                bet_str = "  ".join(
-                    f"{m}x={bet_pcts[i]*100:.1f}%"
-                    for i, m in enumerate(_BET_MULTIPLIERS)
-                )
-                print(f"    bets:    {bet_str}")
 
             if writer:
                 writer.add_scalar("eval/ev", stats["ev"], hands_played)
@@ -446,13 +383,6 @@ def train(args: argparse.Namespace) -> DQNAgent:
                     writer.add_scalar(
                         f"eval/action_pct_{name}", action_pcts[i], hands_played
                     )
-                if bet_enabled:
-                    for i, m in enumerate(_BET_MULTIPLIERS):
-                        writer.add_scalar(
-                            f"eval/bet_pct_{m}x",
-                            stats["bet_counts"][i] / max(stats["bet_counts"].sum(), 1),
-                            hands_played,
-                        )
 
             min_ev = phase.get("min_ev")
             ev_ok = (min_ev is None) or (last_eval_ev >= min_ev)

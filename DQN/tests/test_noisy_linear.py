@@ -169,11 +169,10 @@ class TestNoisyLinear:
 class TestBlackjackNet:
     def _cfg(self):
         return {
-            "obs_dim": 28,
+            "obs_dim": 27,
             "trunk_hidden": 64,   # small for speed
             "head_hidden": 64,
             "playing_actions": 4,
-            "bet_actions": 5,
             "noisy_sigma0": 0.5,
         }
 
@@ -183,21 +182,20 @@ class TestBlackjackNet:
 
     def test_output_shapes(self):
         net = self._make()
-        x = torch.randn(8, 28)
-        play_q, bet_q = net(x)
+        x = torch.randn(8, 27)
+        play_q = net(x)
         assert play_q.shape == (8, 4)
-        assert bet_q.shape  == (8, 5)
 
     def test_reset_noise_affects_output(self):
         net = self._make()
-        x = torch.randn(4, 28)
+        x = torch.randn(4, 27)
         net.reset_noise()
-        out1 = net(x)[0].detach()
+        out1 = net(x).detach()
         # After another reset, output should differ (almost certainly).
         changed = False
         for _ in range(10):
             net.reset_noise()
-            out2 = net(x)[0].detach()
+            out2 = net(x).detach()
             if not torch.allclose(out1, out2, atol=1e-6):
                 changed = True
                 break
@@ -219,9 +217,9 @@ class TestBlackjackNet:
         """Same obs → same output when deterministic."""
         net = self._make()
         net.set_deterministic(True)
-        x = torch.randn(4, 28)
-        out1 = net(x)[0].detach()
-        out2 = net(x)[0].detach()
+        x = torch.randn(4, 27)
+        out1 = net(x).detach()
+        out2 = net(x).detach()
         assert torch.allclose(out1, out2)
         net.set_deterministic(False)
 
@@ -229,7 +227,7 @@ class TestBlackjackNet:
         """Masked (illegal) actions must never be selected."""
         net = self._make()
         net.set_deterministic(True)
-        x = torch.randn(16, 28)
+        x = torch.randn(16, 27)
         # Mask out actions 2 and 3 (double and split) for all envs.
         mask = torch.ones(16, 4, dtype=torch.bool)
         mask[:, 2] = False
@@ -247,22 +245,21 @@ class TestBlackjackNet:
                 "Trunk should use standard Linear, not NoisyLinear"
 
     def test_heads_use_noisy_linear(self):
-        """Each head must contain NoisyLinear layers (4 per dueling head: 2 per stream)."""
+        """play_head must contain NoisyLinear layers (4 per dueling head: 2 per stream)."""
         from agent.noisy_linear import NoisyLinear
         net = self._make()
         expected = 4 if net.dueling else 2
-        for head in (net.play_head, net.bet_head):
-            noisy_count = sum(1 for m in head.modules() if isinstance(m, NoisyLinear))
-            assert noisy_count == expected, (
-                f"Expected {expected} NoisyLinear in head, got {noisy_count}"
-            )
+        noisy_count = sum(1 for m in net.play_head.modules() if isinstance(m, NoisyLinear))
+        assert noisy_count == expected, (
+            f"Expected {expected} NoisyLinear in play_head, got {noisy_count}"
+        )
 
     def test_parameter_count_reasonable(self):
         """Full-size net should have ~400K parameters (within an order of magnitude)."""
         from agent.network import BlackjackNet
         cfg = {
-            "obs_dim": 28, "trunk_hidden": 256, "head_hidden": 256,
-            "playing_actions": 4, "bet_actions": 5, "noisy_sigma0": 0.5,
+            "obs_dim": 27, "trunk_hidden": 256, "head_hidden": 256,
+            "playing_actions": 4, "noisy_sigma0": 0.5,
         }
         net = BlackjackNet(cfg)
         n_params = sum(p.numel() for p in net.parameters())
@@ -272,8 +269,8 @@ class TestBlackjackNet:
         """Loss from play head should produce gradients in trunk parameters."""
         net = self._make()
         net.reset_noise()
-        x = torch.randn(4, 28, requires_grad=False)
-        play_q, _ = net(x)
+        x = torch.randn(4, 27, requires_grad=False)
+        play_q = net(x)
         loss = play_q.sum()
         loss.backward()
         # First trunk Linear should have grad

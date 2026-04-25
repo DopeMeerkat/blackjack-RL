@@ -71,13 +71,13 @@ class TestSumTree:
 
 
 class TestPrioritizedReplayBuffer:
-    OBS_DIM = 28
+    OBS_DIM = 27
 
     def _make(self, capacity=100, alpha=0.6):
         from agent.replay import PrioritizedReplayBuffer
         return PrioritizedReplayBuffer(capacity, self.OBS_DIM, alpha=alpha)
 
-    def _transition(self, reward=0.0, done=False, head_id=0):
+    def _transition(self, reward=0.0, done=False):
         return dict(
             obs=np.random.randn(self.OBS_DIM).astype(np.float32),
             action=1,
@@ -86,7 +86,6 @@ class TestPrioritizedReplayBuffer:
             done=done,
             mask=np.array([True, True, True, False]),
             next_mask=np.array([True, True, False, False]),
-            head_id=head_id,
         )
 
     def test_len_zero_initially(self):
@@ -117,7 +116,6 @@ class TestPrioritizedReplayBuffer:
         assert batch["dones"].shape == (16,)
         assert batch["masks"].shape == (16, 4)
         assert batch["next_masks"].shape == (16, 4)
-        assert batch["head_ids"].shape == (16,)
         assert weights.shape == (16,)
         assert leaf_indices.shape == (16,)
 
@@ -161,14 +159,6 @@ class TestPrioritizedReplayBuffer:
         # It may or may not change depending on values, but shouldn't crash
         assert np.isfinite(new_total)
 
-    def test_head_ids_stored_correctly(self):
-        """head_id field should round-trip through the buffer."""
-        buf = self._make(capacity=20)
-        for i in range(10):
-            buf.add(**self._transition(head_id=(i % 2)))
-        batch, _, _ = buf.sample(10, beta=0.4)
-        assert set(batch["head_ids"]).issubset({0, 1})
-
     def test_circular_overwrite(self):
         """Old transitions should be overwritten when buffer is full."""
         buf = self._make(capacity=5)
@@ -188,9 +178,9 @@ class TestPrioritizedReplayBuffer:
 # ---------------------------------------------------------------------------
 
 class TestNStepAccumulator:
-    OBS_DIM = 28
+    OBS_DIM = 27
 
-    def _t(self, reward=0.0, done=False, head_id=0):
+    def _t(self, reward=0.0, done=False):
         return dict(
             obs=np.zeros(self.OBS_DIM, dtype=np.float32),
             action=0,
@@ -199,7 +189,6 @@ class TestNStepAccumulator:
             done=done,
             mask=np.array([True, True, False, False]),
             next_mask=np.array([True, True, False, False]),
-            head_id=head_id,
         )
 
     def test_no_flush_before_n(self):
@@ -292,7 +281,7 @@ class TestDQNAgent:
     def _cfg(self):
         return {
             # Network
-            "obs_dim": 28, "playing_actions": 4, "bet_actions": 5,
+            "obs_dim": 27, "playing_actions": 4,
             "trunk_hidden": 64, "head_hidden": 64, "noisy_sigma0": 0.5,
             # Training
             "gamma": 1.0, "target_tau": 0.005, "batch_size": 16,
@@ -310,8 +299,8 @@ class TestDQNAgent:
             device=device,
         ), device
 
-    def _fill_replay(self, agent, n=100, head_id=0):
-        obs_dim = 28
+    def _fill_replay(self, agent, n=100):
+        obs_dim = 27
         for i in range(n):
             obs       = np.random.randn(obs_dim).astype(np.float32)
             next_obs  = np.random.randn(obs_dim).astype(np.float32)
@@ -321,7 +310,7 @@ class TestDQNAgent:
                 obs=obs, action=np.random.randint(0, 2),
                 reward=np.random.uniform(-1, 1),
                 next_obs=next_obs, done=bool(i % 5 == 0),
-                mask=mask, next_mask=next_mask, head_id=head_id,
+                mask=mask, next_mask=next_mask,
             )
 
     def test_target_net_is_copy(self):
@@ -382,37 +371,13 @@ class TestDQNAgent:
     def test_action_selection_respects_mask(self):
         """Masked actions must never be chosen by select_play_actions_batch."""
         agent, device = self._make()
-        obs   = np.random.randn(32, 28).astype(np.float32)
+        obs   = np.random.randn(32, 27).astype(np.float32)
         masks = np.ones((32, 4), dtype=bool)
         masks[:, 2] = False   # mask out double
         masks[:, 3] = False   # mask out split
         actions = agent.select_play_actions_batch(obs, masks)
         assert actions.shape == (32,)
         assert (actions < 2).all(), "Should only choose hit(0) or stand(1)"
-
-    def test_bet_action_selection_shape(self):
-        agent, _ = self._make()
-        obs = np.random.randn(16, 28).astype(np.float32)
-        actions = agent.select_bet_actions_batch(obs)
-        assert actions.shape == (16,)
-        assert ((actions >= 0) & (actions < 5)).all()
-
-    def test_train_step_with_bet_transitions(self):
-        """Bet-head transitions (head_id=1) should also produce a valid loss."""
-        agent, _ = self._make()
-        self._fill_replay(agent, n=100, head_id=1)
-        loss = agent.train_step(beta=0.4)
-        assert loss is not None
-        assert np.isfinite(loss)
-
-    def test_train_step_mixed_heads(self):
-        """Buffer with both head_id=0 and head_id=1 should work."""
-        agent, _ = self._make()
-        self._fill_replay(agent, n=60, head_id=0)
-        self._fill_replay(agent, n=60, head_id=1)
-        loss = agent.train_step(beta=0.4)
-        assert loss is not None
-        assert np.isfinite(loss)
 
     def test_state_dict_roundtrip(self):
         """save then load should reproduce identical weights."""
@@ -440,7 +405,7 @@ class TestDQNAgent:
         """
         agent, device = self._make()
         # Create transitions where next state has only action 0 legal.
-        obs_dim = 28
+        obs_dim = 27
         for _ in range(50):
             obs       = np.zeros(obs_dim, dtype=np.float32)
             next_obs  = np.zeros(obs_dim, dtype=np.float32)
@@ -449,7 +414,7 @@ class TestDQNAgent:
             agent.replay.add(
                 obs=obs, action=0, reward=1.0,
                 next_obs=next_obs, done=False,
-                mask=mask, next_mask=next_mask, head_id=0,
+                mask=mask, next_mask=next_mask,
             )
         loss = agent.train_step(beta=1.0)
         assert loss is not None and np.isfinite(loss), \

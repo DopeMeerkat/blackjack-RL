@@ -267,8 +267,7 @@ def make_agent_policy(net: BlackjackNet, device: torch.device):
         obs_t  = torch.tensor(obs_batch,  dtype=torch.float32, device=device)
         mask_t = torch.tensor(mask_batch, dtype=torch.bool,    device=device)
         with torch.no_grad():
-            play_q, _ = net(obs_t)
-            play_q = play_q.clone()
+            play_q = net(obs_t).clone()
             play_q[~mask_t] = -1e9
         return play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
     return policy_fn
@@ -314,14 +313,11 @@ def evaluate_count_aware_agreement(
     # Per-deviation results: keyed by (player_sum, usable_ace, dealer_val, dev_act)
     dev_results: dict[tuple[int, bool, int, int], dict] = {}
 
-    bet_multiplier = 1.0
-
     def _query(obs_np: np.ndarray, mask_np: np.ndarray) -> int:
         obs_t  = torch.tensor(obs_np[None],  dtype=torch.float32, device=device)
         mask_t = torch.tensor(mask_np[None], dtype=torch.bool,    device=device)
         with torch.no_grad():
-            play_q, _ = net(obs_t)
-            play_q = play_q.clone()
+            play_q = net(obs_t).clone()
             play_q[~mask_t] = -1e9
         return int(play_q.argmax(dim=1).item())
 
@@ -343,8 +339,6 @@ def evaluate_count_aware_agreement(
                         can_split=can_split,
                         true_count=tc,
                         decks_remaining=decks_remaining,
-                        bet_multiplier=bet_multiplier,
-                        bet_phase=False,
                     )
                     mask = np.array([True, True, can_double, can_split], dtype=bool)
 

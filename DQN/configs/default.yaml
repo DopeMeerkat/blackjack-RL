@@ -20,9 +20,8 @@ env:
   true_count_min_decks: 0.5       # floor for TC denominator (prevents div by ~0)
 
 state:
-  obs_dim: 28
+  obs_dim: 27
   playing_actions: 4              # hit=0, stand=1, double=2, split=3
-  bet_actions: 5                  # indices into bet_multipliers
 
 network:
   trunk_hidden: 256
@@ -57,25 +56,24 @@ curriculum:
       hands: 5_000_000               # per-phase budget
       actions_allowed: [0, 1]        # hit=0, stand=1
       zero_count: false
-      bet_enabled: false
+
       min_ev: -0.03                  # must exceed before advancing (fraction of 1x bet)
     - name: doubles
       hands: 10_000_000
       actions_allowed: [0, 1, 2]     # adds double=2
       zero_count: false
-      bet_enabled: false
+
       min_ev: -0.025
     - name: splits
       hands: 15_000_000
       actions_allowed: [0, 1, 2, 3]  # adds split=3
       zero_count: false
-      bet_enabled: false
+
       min_ev: -0.015
     - name: full_game
       hands: 170_000_000
       actions_allowed: [0, 1, 2, 3]
       zero_count: false              # true count enabled
-      bet_enabled: true              # bet head trained
       min_ev: null                   # no gate on final phase
 
 eps_greedy:                       # used only for A/B comparison (Milestone 5)

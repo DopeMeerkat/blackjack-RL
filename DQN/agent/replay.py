@@ -1,6 +1,6 @@
 """Prioritized Experience Replay with a SumTree.
 
-Implements the PER algorithm (Schaul et al., 2016) used by the DQN agent.
+Implements the PER algorithm (Schaul et al., 2016) used by the play agent.
 Priorities are stored in a SumTree for O(log N) add and sample operations.
 Importance-sampling weights correct for the non-uniform sampling distribution.
 
@@ -8,8 +8,8 @@ Hyperparameters (from configs/default.yaml):
   alpha = 0.6   — how much prioritization is used (0 = uniform)
   beta         — IS exponent, annealed from 0.4 → 1.0 over training
 
-Each stored transition carries a ``head_id`` field (0 = playing head,
-1 = bet-sizing head) so the training step knows which loss to compute.
+All transitions are play-agent transitions; the bet agent uses a separate,
+much simpler uniform-sampling buffer (see ``agent/bet_agent.py``).
 
 All transitions are stored in pre-allocated NumPy arrays for efficiency.
 A circular write pointer wraps around after ``capacity`` transitions.
@@ -120,7 +120,6 @@ class PrioritizedReplayBuffer:
         self.dones     = np.zeros(capacity,            dtype=bool)
         self.masks     = np.zeros((capacity, 4),       dtype=bool)
         self.next_masks= np.zeros((capacity, 4),       dtype=bool)
-        self.head_ids  = np.zeros(capacity,            dtype=np.int8)
 
         self._write        = 0           # next write position
         self._n_entries    = 0
@@ -139,7 +138,6 @@ class PrioritizedReplayBuffer:
         done: bool,
         mask: np.ndarray,
         next_mask: np.ndarray,
-        head_id: int,
     ) -> None:
         """Add one transition with maximum current priority."""
         i = self._write
@@ -150,7 +148,6 @@ class PrioritizedReplayBuffer:
         self.dones[i]      = done
         self.masks[i]      = mask
         self.next_masks[i] = next_mask
-        self.head_ids[i]   = head_id
 
         # New transitions get max priority so they're sampled at least once.
         priority = self._max_priority ** self.alpha
@@ -215,7 +212,6 @@ class PrioritizedReplayBuffer:
             "dones":      self.dones[leaf_indices],
             "masks":      self.masks[leaf_indices],
             "next_masks": self.next_masks[leaf_indices],
-            "head_ids":   self.head_ids[leaf_indices],
         }
         return batch, weights.astype(np.float32), leaf_indices
 
@@ -315,7 +311,6 @@ class NStepAccumulator:
             done=bool(tail["done"]),
             mask=head["mask"],
             next_mask=tail["next_mask"],
-            head_id=int(head["head_id"]),
             n_step=int(length),
         )
 

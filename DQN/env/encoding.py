@@ -1,10 +1,9 @@
-"""State vector encoder and action mask builder.
+"""State vector encoder and action mask builder for the play agent.
 
-Produces the authoritative 28-dimensional observation vector described in
-blackjack_rl_design.md §3 and the boolean action mask from §4.
-
-All functions are pure (no side effects) and operate on scalar Python values
-for clarity.  The blackjack env calls these at each decision point.
+Produces a 27-dimensional observation vector covering the playing-state
+features and the count features used by the play agent.  The bet agent
+uses a separate observation (per-rank shoe composition) — see
+``env/bet_encoding.py``.
 
 State vector layout (indices are 0-based):
   [0]      player hand sum: (sum - 4) / 17
@@ -16,17 +15,17 @@ State vector layout (indices are 0-based):
   [24]     can-split flag: {0, 1}
   [25]     true count: clip(TC, -5, +5) / 5
   [26]     decks remaining: decks_remaining / 6
-  [27]     current bet (normalised): bet_multiplier / 12
 
-At bet-sizing time the playing-state features are not yet defined and are
-zeroed: indices 0, 1, 2-11, 12-24, 27.  Only obs[25] and obs[26] (count and
-decks) are populated, because cards have not been dealt yet so the dealer
-upcard is also unknown.
+The play agent never sees the bet phase: the training loop reads the
+per-rank composition for the bet agent and steps the env's bet phase
+itself before any play-phase observation is produced.
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+OBS_DIM = 27
 
 # Mapping from raw card rank [1-13] to one-hot index in [0, 9].
 # Ace(1)→0, 2→1, 3→2, ..., 9→8, 10/J/Q/K→9.
@@ -61,37 +60,26 @@ def encode_state(
     can_split: bool,
     true_count: float,
     decks_remaining: float,
-    bet_multiplier: float,         # actual multiplier value (1, 2, 4, 8, or 12)
-    bet_phase: bool = False,
 ) -> np.ndarray:
-    """Return a (28,) float32 observation vector.
+    """Return a (27,) float32 play-phase observation vector."""
+    obs = np.zeros(OBS_DIM, dtype=np.float32)
 
-    When ``bet_phase=True`` the playing-state features (indices 0, 1, 2-11,
-    12-24, 27) are zeroed because the hand has not been dealt yet.  Only the
-    count and decks-remaining features are populated.
-    """
-    obs = np.zeros(28, dtype=np.float32)
+    obs[0] = (player_sum - 4) / 17.0
+    obs[1] = float(usable_ace)
 
-    if not bet_phase:
-        obs[0] = (player_sum - 4) / 17.0
-        obs[1] = float(usable_ace)
+    # Dealer up-card one-hot: obs[2] through obs[11]
+    upcard_idx = _RANK_TO_UPCARD_IDX[dealer_upcard_rank]
+    obs[2 + upcard_idx] = 1.0
 
-        # Dealer up-card one-hot: obs[2] through obs[11]
-        upcard_idx = _RANK_TO_UPCARD_IDX[dealer_upcard_rank]
-        obs[2 + upcard_idx] = 1.0
+    # Pair info
+    obs[12] = float(is_pair)
+    if is_pair and pair_rank is not None:
+        pair_idx = _RANK_TO_PAIR_IDX[pair_rank]
+        obs[13 + pair_idx] = 1.0
 
-        # Pair info
-        obs[12] = float(is_pair)
-        if is_pair and pair_rank is not None:
-            pair_idx = _RANK_TO_PAIR_IDX[pair_rank]
-            obs[13 + pair_idx] = 1.0
+    obs[23] = float(can_double)
+    obs[24] = float(can_split)
 
-        obs[23] = float(can_double)
-        obs[24] = float(can_split)
-
-        obs[27] = bet_multiplier / 12.0
-
-    # Count features are always populated (the agent needs them during bet phase).
     obs[25] = float(np.clip(true_count, -5.0, 5.0)) / 5.0
     obs[26] = decks_remaining / 6.0
 

@@ -6,8 +6,11 @@ Acceptance test for Milestone 2 (blackjack_rl_design.md §13):
   2. Agent's argmax action agrees with the basic-strategy chart on at least
      95% of (player_total, dealer_upcard) cells.
 
+Agent EV is measured under flat 1x bets so the comparison against basic
+strategy is apples-to-apples.
+
 Usage:
-  python eval/compare_basic_strategy.py --checkpoint outputs/checkpoints/play_no_count/final.pt
+  python eval/compare_basic_strategy.py --checkpoint outputs/checkpoints/curriculum/final.pt
   python eval/compare_basic_strategy.py --checkpoint ... --use-count --eval-hands 1000000
 """
 
@@ -18,15 +21,16 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
+from agent.dqn import DQNAgent
 from agent.network import BlackjackNet
 from env.vec_env import VecBlackjackEnv
 from env.encoding import encode_state
+from train.train_curriculum import net_config, train_config
 
 # ---------------------------------------------------------------------------
 # Basic strategy oracle (S17, DAS — same table as in tests/test_env.py)
@@ -111,6 +115,7 @@ def evaluate_ev(
 
     Uses VecBlackjackEnv for batched stepping and policy inference.
     """
+
     vec_env = VecBlackjackEnv(
         num_envs, cfg, seeds=[seed + i for i in range(num_envs)]
     )
@@ -381,14 +386,13 @@ def print_report(
     print(f"  Action agreement: {agreement_pct*100:.1f}%  "
           f"→  {'PASS ✓' if pass_agree else 'FAIL ✗'} (target: ≥ 95%)")
 
-    # Print disagreements
     mismatches = [(k, v) for k, v in detail.items() if not v[2]]
     if mismatches:
         print(f"\n  Mismatches ({len(mismatches)}):")
-        for (psum, ua, d), (agent, bs, _) in sorted(mismatches):
+        for (psum, ua, d), (agent_act, bs, _) in sorted(mismatches):
             hand_type = "soft" if ua else "hard"
             print(f"    {hand_type:4} {psum:2} vs dealer {d:2}:  "
-                  f"agent={ACTION_NAMES[agent]}  bs={ACTION_NAMES[bs]}")
+                  f"agent={ACTION_NAMES[agent_act]}  bs={ACTION_NAMES[bs]}")
     else:
         print("\n  No mismatches — perfect agreement!")
 
@@ -404,68 +408,55 @@ def print_report(
 # Main
 # ---------------------------------------------------------------------------
 
-def load_net(checkpoint_path: str, device: torch.device) -> tuple[BlackjackNet, dict]:
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    cfg  = ckpt["config"]
-
-    # Build merged net config
-    ncfg = {}
-    for v in cfg.values() if isinstance(cfg, dict) else [cfg]:
-        if isinstance(v, dict):
-            ncfg.update(v)
-
-    net = BlackjackNet(ncfg).to(device)
-    net.load_state_dict(ckpt["agent"]["online_net"])
-    return net, ncfg
-
-
 def main(args: argparse.Namespace) -> None:
     device = torch.device(
         "cuda" if (not args.cpu and torch.cuda.is_available()) else "cpu"
     )
     zero_count = not args.use_count
 
-    with open(args.config) as f:
-        raw = yaml.safe_load(f)
-    cfg = {}
-    for v in raw.values():
-        if isinstance(v, dict):
-            cfg.update(v)
-
     print(f"Loading checkpoint: {args.checkpoint}")
-    net, ncfg = load_net(args.checkpoint, device)
-    net.eval()
-    net.set_deterministic(True)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+    print("  Using config from checkpoint.")
 
-    agent_policy = make_agent_policy(net, zero_count, device)
+    agent = DQNAgent(
+        net_config=net_config(cfg),
+        train_config=train_config(cfg),
+        replay_capacity=cfg.get("replay_buffer_size", 1_000_000),
+        device=device,
+    )
+    agent.load_state_dict(ckpt["agent"])
+    print("  Loaded agent weights from checkpoint.")
+
+    agent.online_net.eval()
+    agent.online_net.set_deterministic(True)
+
+    agent_policy = make_agent_policy(agent.online_net, zero_count, device)
     bs_policy = make_bs_policy()
 
     print(f"Evaluating agent EV over {args.eval_hands:,} hands…")
-    ev, ev_stderr = evaluate_ev(
-        agent_policy, cfg, args.eval_hands, seed=args.seed
-    )
+    ev, ev_stderr = evaluate_ev(agent_policy, cfg, args.eval_hands, seed=args.seed)
 
     print(f"Evaluating basic-strategy EV over {args.eval_hands:,} hands…")
-    bs_ev, bs_ev_stderr = evaluate_ev(
-        bs_policy, cfg, args.eval_hands, seed=args.seed
-    )
+    bs_ev, bs_ev_stderr = evaluate_ev(bs_policy, cfg, args.eval_hands, seed=args.seed)
 
     print("Checking action agreement against basic strategy…")
-    agreement_pct, detail = evaluate_action_agreement(net, zero_count, device, cfg)
+    agreement_pct, detail = evaluate_action_agreement(
+        agent.online_net, zero_count, device, cfg
+    )
 
     print_report(ev, ev_stderr, bs_ev, bs_ev_stderr, agreement_pct, detail, zero_count)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare trained policy to basic strategy")
-    p.add_argument("--checkpoint",  required=True,
+    p.add_argument("--checkpoint", required=True,
                    help="Path to checkpoint .pt file")
-    p.add_argument("--config",      default="configs/default.yaml")
-    p.add_argument("--use-count",   action="store_true",
+    p.add_argument("--use-count",  action="store_true",
                    help="Don't zero the count feature (Milestone 3 checkpoint)")
-    p.add_argument("--eval-hands",  type=int, default=1_000_000)
-    p.add_argument("--seed",        type=int, default=0)
-    p.add_argument("--cpu",         action="store_true")
+    p.add_argument("--eval-hands", type=int, default=1_000_000)
+    p.add_argument("--seed",       type=int, default=99999)
+    p.add_argument("--cpu",        action="store_true")
     return p.parse_args()
 
 

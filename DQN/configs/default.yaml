@@ -7,9 +7,9 @@ env:
   # Reshuffle when cards_remaining / 52 < reshuffle_threshold
   reshuffle_threshold: 1.5        # decks remaining that triggers reshuffle (= 78 cards)
   dealer_stands_soft_17: true     # S17 rule
-  double_after_split: true          # DAS allowed
+  double_after_split: false          # DAS allowed
   # Max total sub-hands from splitting (3 splits = 4 hands)
-  resplit_max_hands: 3
+  resplit_max_hands: 2
   blackjack_payout: 1.5           # 3:2
   surrender: false
   # Insurance is hard-coded (not learned): take when true count >= threshold
@@ -26,13 +26,13 @@ state:
 
 network:
   trunk_hidden: 256
-  trunk_layers: 3
+  trunk_layers: 4
   head_hidden: 256
   noisy_sigma0: 0.3               # initial sigma for NoisyLinear layers
   dueling: true                   # Rainbow: V(s) + A(s,a) − mean_a A(s,a) combination
   n_atoms: 51                     # C51: number of atoms in the value distribution
-  v_min: -5.0                   # C51: left edge of atom support
-  v_max:  5.0                   # C51: right edge of atom support
+  v_min: -15.0                   # C51: left edge of atom support
+  v_max:  15.0                   # C51: right edge of atom support
 
 training:
   algorithm: double_dqn
@@ -46,7 +46,7 @@ training:
   train_every_n_steps: 4             # gradient update frequency
   warmup_transitions: 50000          # don't train until this many transitions are in the buffer
   gamma: 1.0                         # discount within a hand (short horizon)
-  n_step: 3                          # Rainbow n-step return horizon for play-head targets
+  n_step: 2                          # Rainbow n-step return horizon for play-head targets
   total_hands: 200_000_000           # joint training budget
   total_hands_no_count: 20_000_000
   total_hands_with_count: 50_000_000
@@ -56,21 +56,21 @@ curriculum:
     - name: hit_stand
       hands: 5_000_000               # per-phase budget
       actions_allowed: [0, 1]        # hit=0, stand=1
-      zero_count: true
+      zero_count: false
       bet_enabled: false
       min_ev: -0.03                  # must exceed before advancing (fraction of 1x bet)
     - name: doubles
       hands: 10_000_000
       actions_allowed: [0, 1, 2]     # adds double=2
-      zero_count: true
+      zero_count: false
       bet_enabled: false
-      min_ev: -0.02
+      min_ev: -0.025
     - name: splits
       hands: 15_000_000
       actions_allowed: [0, 1, 2, 3]  # adds split=3
-      zero_count: true
+      zero_count: false
       bet_enabled: false
-      min_ev: -0.01
+      min_ev: -0.015
     - name: full_game
       hands: 170_000_000
       actions_allowed: [0, 1, 2, 3]

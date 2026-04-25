@@ -24,6 +24,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import time
 from pathlib import Path
@@ -193,7 +194,19 @@ def quick_eval(
 # ---------------------------------------------------------------------------
 
 def train(args: argparse.Namespace) -> DQNAgent:
-    cfg = load_config(args.config)
+    device = torch.device(
+        "cuda" if (not args.cpu and torch.cuda.is_available()) else "cpu"
+    )
+
+    ckpt = None
+    if args.checkpoint:
+        chkpt_path = f"./outputs/checkpoints/{args.exp_name}/{args.checkpoint}"
+        print(f"Loading checkpoint: {chkpt_path}")
+        ckpt = torch.load(chkpt_path, map_location=device, weights_only=False)
+        cfg = ckpt["config"]
+        print("  Using config from checkpoint.")
+    else:
+        cfg = load_config(args.config)
 
     phases: list[dict] = cfg.get("phases", [])
     if not phases:
@@ -201,11 +214,8 @@ def train(args: argparse.Namespace) -> DQNAgent:
                          "Check 'curriculum.phases' in default.yaml.")
 
     total_hands = args.total_hands or cfg.get("total_hands", 200_000_000)
-    exp_name = args.exp_name or "curriculum"
+    exp_name = args.exp_name
 
-    device = torch.device(
-        "cuda" if (not args.cpu and torch.cuda.is_available()) else "cpu"
-    )
     print(f"Device:       {device}")
     print(f"Experiment:   {exp_name}")
     print(f"Total hands:  {total_hands:,}")
@@ -228,11 +238,9 @@ def train(args: argparse.Namespace) -> DQNAgent:
         device=device,
     )
 
-    if args.checkpoint:
-        print(f"Loading checkpoint: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if ckpt is not None:
         agent.load_state_dict(ckpt["agent"])
-        print("  Loaded.")
+        print("  Loaded agent weights from checkpoint.")
 
     num_envs = cfg.get("num_envs", 64)
     vec_env = VecBlackjackEnv(
@@ -255,9 +263,18 @@ def train(args: argparse.Namespace) -> DQNAgent:
     hand_reward_accum = np.zeros(num_envs, dtype=np.float32)
     dummy_mask = np.array([True, True, True, True], dtype=bool)
 
-    # Curriculum state
-    phase_idx = 0
-    phase_hands = 0
+    # Curriculum state (resumed from checkpoint if present)
+    if ckpt is not None:
+        phase_idx = ckpt["phase_idx"]
+        phase_hands = ckpt["phase_hands"]
+        hands_played = ckpt["hands_played"]
+        print(f"  Resumed at phase={phases[phase_idx]['name']}, "
+              f"phase_hands={phase_hands:,}, hands_played={hands_played:,}")
+    else:
+        phase_idx = 0
+        phase_hands = 0
+        hands_played = 0
+
     last_eval_ev = -np.inf
 
     def current_phase() -> dict:
@@ -274,14 +291,24 @@ def train(args: argparse.Namespace) -> DQNAgent:
         if writer:
             writer.add_scalar("train/curriculum_phase", idx, hp)
 
-    announce_phase(phase_idx, 0)
+    announce_phase(phase_idx, hands_played)
 
     obs_arr, masks_arr, infos = vec_env.reset()
     global_step = 0
-    hands_played = 0
-    last_eval = 0
-    last_ckpt = 0
+    last_eval = hands_played
+    last_ckpt = hands_played
     t_start = time.time()
+
+    # Ctrl+C → finish current step then save an interrupt checkpoint.
+    # A second Ctrl+C restores the default handler and hard-kills.
+    _interrupted = [False]
+
+    def _handle_sigint(signum, frame):
+        _interrupted[0] = True
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print("\n[Interrupted] Finishing current step, then saving…")
+
+    signal.signal(signal.SIGINT, _handle_sigint)
 
     print(f"\nStarting curriculum training...  "
           f"(batch_size={agent.batch_size}, buffer={agent.replay.capacity:,})")
@@ -456,6 +483,21 @@ def train(args: argparse.Namespace) -> DQNAgent:
             }, ckpt_path)
             last_ckpt = hands_played
 
+        # --- Save on interrupt ---
+        if _interrupted[0]:
+            interrupt_path = ckpt_dir / f"interrupt_{hands_played:010d}.pt"
+            torch.save({
+                "agent": agent.state_dict(),
+                "hands_played": hands_played,
+                "phase_idx": phase_idx,
+                "phase_hands": phase_hands,
+                "config": cfg,
+            }, interrupt_path)
+            print(f"[Interrupted] Saved checkpoint: {interrupt_path}")
+            if writer:
+                writer.close()
+            return agent
+
     # --- Final checkpoint ---
     final_path = ckpt_dir / "final.pt"
     torch.save({
@@ -484,7 +526,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--total-hands", type=int, default=None,
                    help="Override total training hands (default: from config).")
-    p.add_argument("--exp-name", default=None,
+    p.add_argument("--exp-name", default=None, required=True,
                    help="Experiment name for checkpoints/logs.")
     p.add_argument("--checkpoint", default=None,
                    help="Optional: warm-start from an existing checkpoint.")

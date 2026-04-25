@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import yaml
 from scipy import stats as sp_stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from agent.network import BlackjackNet
-from env.blackjack import BlackjackEnv
+from agent.dqn import DQNAgent
+from env.vec_env import VecBlackjackEnv
+from train.train_curriculum import net_config, train_config
 
 _BET_MULTIPLIERS = [1, 2, 4, 8, 12]
 
@@ -52,57 +53,117 @@ def load_net(checkpoint_path: str, device: torch.device) -> tuple[BlackjackNet, 
 
 
 # ---------------------------------------------------------------------------
-# Single-shoe rollout
+# Vectorised paired rollout
 # ---------------------------------------------------------------------------
 
-def play_shoe(
+def _compute_actions_batched(
+    net: BlackjackNet,
+    obs_j: np.ndarray,
+    mask_j: np.ndarray,
+    obs_f: np.ndarray,
+    mask_f: np.ndarray,
+    bet_phase_j: np.ndarray,
+    bet_phase_f: np.ndarray,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """One network forward over both joint+flat batches; return action arrays.
+
+    Joint and flat envs see different observations (bet multiplier in obs[27]),
+    so play decisions can't be shared. But concatenating both into a single
+    (2N, 28) forward amortises GPU launch overhead — the dominant cost in the
+    pre-vectorised version.
+    """
+    n = obs_j.shape[0]
+    all_obs   = np.concatenate([obs_j,  obs_f],  axis=0)
+    all_masks = np.concatenate([mask_j, mask_f], axis=0)
+
+    obs_t  = torch.from_numpy(all_obs).to(device=device, dtype=torch.float32)
+    mask_t = torch.from_numpy(all_masks).to(device=device, dtype=torch.bool)
+
+    with torch.no_grad():
+        play_q, bet_q = net(obs_t)
+        play_q = play_q.masked_fill(~mask_t, -1e9)
+        play_arg = play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
+        bet_arg  = bet_q.argmax(dim=1).cpu().numpy().astype(np.int32)
+
+    play_j, play_f = play_arg[:n], play_arg[n:]
+    bet_j          = bet_arg[:n]   # only joint uses learned bets
+
+    actions_j = np.where(bet_phase_j, bet_j, play_j).astype(np.int32)
+    actions_f = np.where(bet_phase_f, np.int32(0), play_f).astype(np.int32)
+    return actions_j, actions_f
+
+
+def play_round(
     net: BlackjackNet,
     cfg: dict,
     device: torch.device,
-    seed: int,
-    use_bet_head: bool,
-) -> tuple[float, list[tuple[float, int]]]:
-    """Play one full shoe and return (total_reward, [(tc, bet_mult), ...]).
+    seeds: list[int],
+) -> tuple[np.ndarray, np.ndarray, list[tuple[float, int]]]:
+    """Play one shoe in each of len(seeds) parallel envs, paired joint+flat.
 
-    When use_bet_head=False, all bets are flat 1x (for the paired comparison).
+    Returns (joint_shoe_rewards, flat_shoe_rewards, tc_bet_pairs).  Each reward
+    array has shape (len(seeds),); entry i is the total reward for env i's
+    single shoe under the corresponding policy.  Joint and flat use identical
+    seeds so the paired t-test on shoe rewards remains valid.
     """
-    env = BlackjackEnv(cfg, seed=seed)
-    obs, mask, info = env.reset()
+    n = len(seeds)
+    reshuffle_threshold = cfg.get("reshuffle_threshold", 1.5)
 
-    shoe_reward = 0.0
-    tc_bet_pairs = []
+    joint_env = VecBlackjackEnv(n, cfg, seeds=seeds)
+    flat_env  = VecBlackjackEnv(n, cfg, seeds=seeds)
 
-    while True:
-        if info["phase"] == "bet":
-            if use_bet_head:
-                obs_t = torch.tensor(obs[None], dtype=torch.float32, device=device)
-                with torch.no_grad():
-                    _, bet_q = net(obs_t)
-                bet_idx = int(bet_q.argmax(dim=1).item())
+    obs_j, mask_j, info_j = joint_env.reset()
+    obs_f, mask_f, info_f = flat_env.reset()
+
+    joint_rewards = np.zeros(n, dtype=np.float64)
+    flat_rewards  = np.zeros(n, dtype=np.float64)
+    joint_active  = np.ones(n, dtype=bool)
+    flat_active   = np.ones(n, dtype=bool)
+    tc_bet_pairs: list[tuple[float, int]] = []
+
+    while joint_active.any() or flat_active.any():
+        bet_phase_j = np.array([i["phase"] == "bet" for i in info_j], dtype=bool)
+        bet_phase_f = np.array([i["phase"] == "bet" for i in info_f], dtype=bool)
+
+        actions_j, actions_f = _compute_actions_batched(
+            net, obs_j, mask_j, obs_f, mask_f,
+            bet_phase_j, bet_phase_f, device,
+        )
+
+        # Record (true_count, chosen_bet) for the joint env's bet decisions
+        # (active envs only).
+        record_idx = np.where(joint_active & bet_phase_j)[0]
+        for i in record_idx:
+            tc_bet_pairs.append((
+                info_j[i]["true_count"],
+                _BET_MULTIPLIERS[int(actions_j[i])],
+            ))
+
+        obs_j, mask_j, rews_j, dones_j, info_j = joint_env.step(actions_j)
+        obs_f, mask_f, rews_f, dones_f, info_f = flat_env.step(actions_f)
+
+        joint_rewards += rews_j * joint_active
+        flat_rewards  += rews_f * flat_active
+
+        # When a hand finishes, either close out the shoe (mark inactive so its
+        # rewards stop being recorded) or reset to start the next hand.  The
+        # zombie envs continue stepping in lockstep but their results are
+        # masked out — extra GPU work is bounded by the variance in shoe length.
+        for i in np.where(joint_active & dones_j)[0]:
+            if joint_env._envs[i].cards_in_shoe / 52.0 < reshuffle_threshold:
+                joint_active[i] = False
             else:
-                bet_idx = 0  # flat 1x
+                o, m, inf = joint_env.reset_at(i)
+                obs_j[i], mask_j[i], info_j[i] = o, m, inf
+        for i in np.where(flat_active & dones_f)[0]:
+            if flat_env._envs[i].cards_in_shoe / 52.0 < reshuffle_threshold:
+                flat_active[i] = False
+            else:
+                o, m, inf = flat_env.reset_at(i)
+                obs_f[i], mask_f[i], info_f[i] = o, m, inf
 
-            tc_bet_pairs.append((info["true_count"], _BET_MULTIPLIERS[bet_idx]))
-            action = bet_idx
-        else:
-            obs_t = torch.tensor(obs[None], dtype=torch.float32, device=device)
-            mask_t = torch.tensor(mask[None], dtype=torch.bool, device=device)
-            with torch.no_grad():
-                play_q, _ = net(obs_t)
-                play_q = play_q.clone()
-                play_q[~mask_t] = -1e9
-            action = int(play_q.argmax(dim=1).item())
-
-        obs, mask, reward, done, info = env.step(action)
-        if done:
-            shoe_reward += reward
-            # Check if shoe is nearly depleted (env reshuffles at start of
-            # next hand, but we track cards_in_shoe to decide when to stop)
-            if env.cards_in_shoe / 52.0 < cfg.get("reshuffle_threshold", 1.5):
-                break
-            obs, mask, info = env.reset()
-
-    return shoe_reward, tc_bet_pairs
+    return joint_rewards, flat_rewards, tc_bet_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -115,28 +176,29 @@ def evaluate(
     device: torch.device,
     n_shoes: int,
     base_seed: int,
+    num_envs: int = 1024,
 ) -> dict:
     """Run paired evaluation: joint policy vs flat-bet variant on same seeds.
 
-    Returns a dict with all metrics needed for the Milestone 4 report.
+    Shoes are processed in rounds of up to ``num_envs`` parallel envs to keep
+    memory bounded while amortising GPU launches over a large batch.
     """
     net.set_deterministic(True)
 
-    joint_shoe_rewards = []
-    flat_shoe_rewards = []
-    all_tc_bet_pairs = []
+    joint_shoe_rewards: list[float] = []
+    flat_shoe_rewards: list[float] = []
+    all_tc_bet_pairs: list[tuple[float, int]] = []
 
-    for i in range(n_shoes):
-        seed = base_seed + i
-
-        # Joint policy (bet head active)
-        jr, tc_bets = play_shoe(net, cfg, device, seed, use_bet_head=True)
-        joint_shoe_rewards.append(jr)
-        all_tc_bet_pairs.extend(tc_bets)
-
-        # Flat-bet variant (same playing policy, 1x bet always)
-        fr, _ = play_shoe(net, cfg, device, seed, use_bet_head=False)
-        flat_shoe_rewards.append(fr)
+    n_done = 0
+    while n_done < n_shoes:
+        n_in_round = min(num_envs, n_shoes - n_done)
+        seeds = [base_seed + n_done + i for i in range(n_in_round)]
+        jr, fr, tcb = play_round(net, cfg, device, seeds)
+        joint_shoe_rewards.extend(jr.tolist())
+        flat_shoe_rewards.extend(fr.tolist())
+        all_tc_bet_pairs.extend(tcb)
+        n_done += n_in_round
+        print(f"  ... {n_done:,}/{n_shoes:,} shoes done")
 
     net.set_deterministic(False)
 
@@ -285,16 +347,33 @@ def main(args: argparse.Namespace) -> None:
     )
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    net, cfg = load_net(args.checkpoint, device)
-    net.eval()
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+    print("  Using config from checkpoint.")
+
+    agent = DQNAgent(
+        net_config=net_config(cfg),
+        train_config=train_config(cfg),
+        replay_capacity=cfg.get("replay_buffer_size", 1_000_000),
+        device=device,
+    )
+    agent.load_state_dict(ckpt["agent"])
+    print("  Loaded agent weights from checkpoint.")
+
+    agent.online_net.eval()
+    agent.online_net.set_deterministic(True)
 
     # Estimate shoes needed for the requested number of hands.
     # A 6-deck shoe at 75% penetration yields roughly 60-80 hands.
     hands_per_shoe = 70
     n_shoes = max(args.eval_hands // hands_per_shoe, 100)
 
-    print(f"Evaluating over {n_shoes:,} shoes (~{n_shoes * hands_per_shoe:,} hands)...")
-    results = evaluate(net, cfg, device, n_shoes, base_seed=args.seed)
+    print(f"Evaluating over {n_shoes:,} shoes (~{n_shoes * hands_per_shoe:,} hands), "
+          f"{args.num_envs} parallel envs per round...")
+    results = evaluate(
+        agent.online_net, cfg, device, n_shoes,
+        base_seed=args.seed, num_envs=args.num_envs,
+    )
     print_report(results)
 
 
@@ -306,6 +385,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-hands", type=int, default=1_000_000,
                    help="Approximate number of hands to evaluate")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num-envs", type=int, default=1024,
+                   help="Parallel envs per round (larger = better GPU utilisation)")
     p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 

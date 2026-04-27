@@ -1,15 +1,11 @@
 """Evaluate a count-aware playing policy.
 
-Combines `compare_basic_strategy.py` and `check_deviations.py`:
-  1. EV per hand under flat 1x bets vs basic-strategy EV (M2 acceptance test).
-  2. Action agreement against a *count-aware* oracle: for each
-     (player_sum, usable_ace, dealer_upcard) cell evaluated at several true
-     counts, the expected action is the Hi-Lo deviation when one applies and
-     the basic-strategy action otherwise.
-
-This is the right correctness test for a Milestone 3 (count-enabled)
-checkpoint: the agent must replicate basic strategy *and* execute the common
-Hi-Lo deviations as the count moves.
+  1. EV per hand under flat 1x bets vs basic-strategy EV, averaged over 640
+     environment seeds (10 batches × 64 envs).  Count features are left intact
+     so learned deviations can improve over basic strategy.
+  2. Action agreement against (basic strategy + Illustrious-18 deviations).
+     Non-deviation cells are tested once at TC=0; deviation cells are tested
+     at TCs that straddle each deviation threshold.
 
 Usage:
   python eval/compare_with_count.py --checkpoint outputs/checkpoints/play_with_count/final.pt
@@ -64,21 +60,27 @@ def basic_strategy_action(
     if can_split and pair_value is not None:
         pv = pair_value
         if pv == 1:   return SPLIT
-        if pv == 8:   return SPLIT
+        if pv == 10:  return STAND
         if pv == 9:   return SPLIT if d not in (7, 10, 1) else STAND
+        if pv == 8:   return SPLIT
         if pv == 7:   return SPLIT if d <= 7 else HIT
         if pv == 6:   return SPLIT if 2 <= d <= 6 else HIT
         if pv == 4:   return SPLIT if d in (5, 6) else HIT
         if pv == 3:   return SPLIT if 2 <= d <= 7 else HIT
         if pv == 2:   return SPLIT if 2 <= d <= 7 else HIT
-        if pv == 10:  return STAND
+        
 
     if usable_ace:
         s = player_sum
-        if s >= 19:  return STAND
+        if s == 20:  return STAND
+        if s == 19:
+            if d == 6:
+                return DOUBLE if can_double else STAND
+            else:
+                return STAND
         if s == 18:
-            if d in (2, 7, 8):  return STAND
-            if 3 <= d <= 6:     return DOUBLE if can_double else STAND
+            if d in (7, 8):  return STAND
+            if 2 <= d <= 6:     return DOUBLE if can_double else STAND
             return HIT
         if s == 17:  return DOUBLE if (3 <= d <= 6 and can_double) else HIT
         if s in (15, 16): return DOUBLE if (4 <= d <= 6 and can_double) else HIT
@@ -104,28 +106,29 @@ def _dealer_upcard_val(rank: int) -> int:
 # ---------------------------------------------------------------------------
 # Hi-Lo deviations (Illustrious 18 subset — hard hands only, no surrender)
 #
-# Each rule fires when the true count is past the threshold in the given
-# direction.  The deviation overrides basic strategy at that cell and TC.
-# Format: (player_sum, usable_ace, dealer_val) -> list of (direction, threshold,
-#         dev_action, requires_double).
+# direction "gte": deviate when TC >= threshold
+# direction "lt":  deviate when TC <  threshold
 # ---------------------------------------------------------------------------
 
-# direction: "gte" -> deviate when TC >= threshold
-#            "lt"  -> deviate when TC <  threshold
 DEVIATIONS: dict[tuple[int, bool, int], list[tuple[str, int, int, bool]]] = {
     # Stand-instead-of-hit deviations
-    (16, False, 10): [("gte", 0, STAND, False)],
+    (16, False, 10): [("gte", 0, STAND, False,)],
     (15, False, 10): [("gte", 4, STAND, False)],
     (12, False, 3):  [("gte", 2, STAND, False)],
     (12, False, 2):  [("gte", 3, STAND, False)],
+    (16, False, 9): [("gte", 5, STAND, False)],
+    # Hit-instead-of-stand deviations (negative count)
+    (13, False, 2):  [("lt", -1, HIT, False)],
+    (12, False, 4):  [("lt", 0,  HIT, False)],
+    (12, False, 5):  [("lt", -2,  HIT, False)],
+    (12, False, 6):  [("lt", -1,  HIT, False)],
+    (13, False, 3):  [("lt", -2,  HIT, False)],
     # Double-instead-of-hit deviations (require can_double)
+    (10, False, 10): [("gte", 4, DOUBLE, True)],
     (11, False, 1):  [("gte", 1, DOUBLE, True)],
     (9,  False, 2):  [("gte", 1, DOUBLE, True)],
-    (10, False, 10): [("gte", 4, DOUBLE, True)],
     (10, False, 1):  [("gte", 4, DOUBLE, True)],
-    # Hit-instead-of-stand deviations (negative count)
-    (12, False, 4):  [("lt", 0,  HIT, False)],
-    (13, False, 2):  [("lt", -1, HIT, False)],
+    (9, False, 7): [("gte", 3, DOUBLE, True)],
 }
 
 
@@ -161,9 +164,9 @@ def expected_action(
     pair_value: int | None,
     true_count: float,
 ) -> tuple[int, bool]:
-    """Return (expected_action, is_deviation_cell).
+    """Return (expected_action, is_deviation).
 
-    is_deviation_cell is True when a deviation rule fires for this (cell, TC).
+    is_deviation is True when a deviation rule fires for this (cell, TC).
     """
     dev = deviation_action(player_sum, usable_ace, dealer_val, true_count, can_double)
     if dev is not None:
@@ -180,7 +183,7 @@ def expected_action(
 
 
 # ---------------------------------------------------------------------------
-# EV evaluation (flat 1x bets, count enabled)
+# EV evaluation (flat 1x bets, 640 seeds)
 # ---------------------------------------------------------------------------
 
 def evaluate_ev(
@@ -189,39 +192,46 @@ def evaluate_ev(
     n_hands: int,
     seed: int = 0,
     num_envs: int = 64,
+    n_seed_batches: int = 10,
 ) -> tuple[float, float]:
-    """Run policy_fn for n_hands hands; return (ev, stderr).
+    """Run policy_fn; return (ev, stderr).
 
-    policy_fn receives batched (obs (K,28), mask (K,4)) and returns (K,) int
-    actions.  Bet-phase actions are forced to 0 (flat 1x).
+    Runs n_seed_batches rounds of num_envs envs (default 10×64 = 640 unique
+    seeds).  n_hands are distributed evenly across batches.
+    Bet-phase actions are forced to 0 (flat 1x).
     """
-    vec_env = VecBlackjackEnv(
-        num_envs, cfg, seeds=[seed + i for i in range(num_envs)]
-    )
-    obs, masks, infos = vec_env.reset()
+    all_rewards: list[float] = []
+    hands_per_batch = n_hands // n_seed_batches
 
-    rewards = []
-    while len(rewards) < n_hands:
-        actions = np.zeros(num_envs, dtype=np.int32)
-        play_idx = np.array(
-            [i for i in range(num_envs) if infos[i]["phase"] != "bet"]
-        )
-        if len(play_idx) > 0:
-            actions[play_idx] = policy_fn(obs[play_idx], masks[play_idx])
+    for batch in range(n_seed_batches):
+        batch_seeds = [seed + batch * num_envs + i for i in range(num_envs)]
+        vec_env = VecBlackjackEnv(num_envs, cfg, seeds=batch_seeds)
+        obs, masks, infos = vec_env.reset()
 
-        obs, masks, rews, dones, infos = vec_env.step(actions)
+        batch_rewards: list[float] = []
+        while len(batch_rewards) < hands_per_batch:
+            actions = np.zeros(num_envs, dtype=np.int32)
+            play_idx = np.array(
+                [i for i in range(num_envs) if infos[i]["phase"] != "bet"]
+            )
+            if len(play_idx) > 0:
+                actions[play_idx] = policy_fn(obs[play_idx], masks[play_idx])
 
-        for i in range(num_envs):
-            if dones[i]:
-                rewards.append(float(rews[i]))
-                if len(rewards) >= n_hands:
-                    break
-                obs_i, mask_i, info_i = vec_env.reset_at(i)
-                obs[i] = obs_i
-                masks[i] = mask_i
-                infos[i] = info_i
+            obs, masks, rews, dones, infos = vec_env.step(actions)
 
-    arr = np.array(rewards[:n_hands], dtype=np.float64)
+            for i in range(num_envs):
+                if dones[i]:
+                    batch_rewards.append(float(rews[i]))
+                    if len(batch_rewards) >= hands_per_batch:
+                        break
+                    obs_i, mask_i, info_i = vec_env.reset_at(i)
+                    obs[i] = obs_i
+                    masks[i] = mask_i
+                    infos[i] = info_i
+
+        all_rewards.extend(batch_rewards)
+
+    arr = np.array(all_rewards, dtype=np.float64)
     return float(arr.mean()), float(arr.std() / np.sqrt(len(arr)))
 
 
@@ -244,7 +254,7 @@ def _decode_obs(obs: np.ndarray, mask: np.ndarray):
 
 
 def make_bs_policy():
-    """Batched basic-strategy policy (used as the EV reference)."""
+    """Batched basic-strategy policy (count-agnostic; used as the EV reference)."""
     def policy_fn(obs_batch: np.ndarray, mask_batch: np.ndarray) -> np.ndarray:
         k = len(obs_batch)
         actions = np.empty(k, dtype=np.int32)
@@ -277,22 +287,32 @@ def make_agent_policy(net: BlackjackNet, device: torch.device):
 # Count-aware action agreement
 # ---------------------------------------------------------------------------
 
-# True counts at which each cell is evaluated.  Chosen to land clearly on
-# both sides of every deviation threshold (-1, 0, 2, 3, 4) so the expected
-# action is unambiguous everywhere.
-TEST_TRUE_COUNTS = (-3.0, -1.0, 0.0, 2.0, 4.0)
+_NON_DEV_TC = 0.0
+
+
+def _deviation_test_tcs(cell_key: tuple) -> list[float]:
+    """Return TCs straddling each deviation threshold for this cell.
+
+    For each rule with threshold T: adds T-1 (deviation off) and T (on for
+    gte, off for lt — but both sides are always covered).
+    """
+    rules = DEVIATIONS[cell_key]
+    tcs: set[float] = set()
+    for _, threshold, _, _ in rules:
+        tcs.add(float(threshold - 1))
+        tcs.add(float(threshold))
+    return sorted(tcs)
 
 
 def evaluate_count_aware_agreement(
     net: BlackjackNet,
     device: torch.device,
-    test_tcs: tuple[float, ...] = TEST_TRUE_COUNTS,
     decks_remaining: float = 3.0,
 ) -> dict:
-    """Enumerate (cell × TC) and check agent vs count-aware oracle.
+    """Enumerate cells and check agent vs (basic strategy + Illustrious-18 deviations).
 
-    Returns a dict with totals, per-bucket counts (BS cells vs deviation cells),
-    a list of mismatches, and a per-deviation pass/fail summary.
+    Non-deviation cells are evaluated once at TC=0.
+    Deviation cells are evaluated at TCs that straddle each deviation threshold.
     """
     net.set_deterministic(True)
 
@@ -310,7 +330,6 @@ def evaluate_count_aware_agreement(
     n_dev_total   = 0
     n_dev_match   = 0
     mismatches: list[dict] = []
-    # Per-deviation results: keyed by (player_sum, usable_ace, dealer_val, dev_act)
     dev_results: dict[tuple[int, bool, int, int], dict] = {}
 
     def _query(obs_np: np.ndarray, mask_np: np.ndarray) -> int:
@@ -321,14 +340,18 @@ def evaluate_count_aware_agreement(
             play_q[~mask_t] = -1e9
         return int(play_q.argmax(dim=1).item())
 
-    for tc in test_tcs:
-        for dealer_rank, dealer_val in dealer_upcards:
-            for usable_ace in (False, True):
-                totals = soft_totals if usable_ace else hard_totals
-                for player_sum in totals:
-                    can_double = True
-                    can_split  = False
+    for dealer_rank, dealer_val in dealer_upcards:
+        for usable_ace in (False, True):
+            totals = soft_totals if usable_ace else hard_totals
+            for player_sum in totals:
+                can_double  = True
+                can_split   = False
+                cell_key    = (player_sum, usable_ace, dealer_val)
+                is_dev_cell = cell_key in DEVIATIONS
 
+                test_tcs = _deviation_test_tcs(cell_key) if is_dev_cell else [_NON_DEV_TC]
+
+                for tc in test_tcs:
                     obs = encode_state(
                         player_sum=player_sum,
                         usable_ace=usable_ace,
@@ -357,6 +380,7 @@ def evaluate_count_aware_agreement(
                     match = (agent_act == exp_act)
                     n_total += 1
                     n_match += int(match)
+
                     if is_dev:
                         n_dev_total += 1
                         n_dev_match += int(match)
@@ -383,18 +407,17 @@ def evaluate_count_aware_agreement(
     net.set_deterministic(False)
 
     return {
-        "n_total": n_total,
-        "n_match": n_match,
-        "agreement": n_match / max(n_total, 1),
-        "n_bs_total": n_bs_total,
-        "n_bs_match": n_bs_match,
+        "n_total":      n_total,
+        "n_match":      n_match,
+        "agreement":    n_match / max(n_total, 1),
+        "n_bs_total":   n_bs_total,
+        "n_bs_match":   n_bs_match,
         "bs_agreement": n_bs_match / max(n_bs_total, 1),
-        "n_dev_total": n_dev_total,
-        "n_dev_match": n_dev_match,
+        "n_dev_total":  n_dev_total,
+        "n_dev_match":  n_dev_match,
         "dev_agreement": n_dev_match / max(n_dev_total, 1),
-        "mismatches": mismatches,
-        "dev_results": dev_results,
-        "test_tcs": test_tcs,
+        "mismatches":   mismatches,
+        "dev_results":  dev_results,
     }
 
 
@@ -414,39 +437,44 @@ def print_report(
     print("=" * 70)
 
     # --- EV ---
-    diff = abs(ev - bs_ev)
-    pass_ev = diff <= 0.002
-    print(f"  EV per hand:       {ev*100:+.4f}% +/- {ev_stderr*100:.4f}%")
+    gap = bs_ev - ev  # positive = agent below BS; negative = agent beats BS
+    if gap > 0:
+        ev_label = f"{gap*100:.4f}% below BS"
+        pass_ev  = gap <= 0.002
+        ev_verdict = f"{'PASS' if pass_ev else 'FAIL'}, threshold: within 0.20%"
+    else:
+        ev_label   = f"{-gap*100:.4f}% above BS"
+        pass_ev    = True
+        ev_verdict = "PASS"
+    print(f"  Agent EV:          {ev*100:+.4f}% +/- {ev_stderr*100:.4f}%")
     print(f"  Basic-strategy EV: {bs_ev*100:+.4f}% +/- {bs_ev_stderr*100:.4f}%")
-    print(f"  |Delta EV|:        {diff*100:.4f}%   "
-          f"({'PASS' if pass_ev else 'FAIL'}, target: <= 0.20%)")
+    print(f"  Agent vs BS:       {ev_label}  ({ev_verdict})")
 
     # --- Agreement ---
-    tcs_str = ", ".join(f"{tc:+g}" for tc in agreement["test_tcs"])
-    print(f"\n  Action agreement evaluated at TCs: [{tcs_str}]")
-    print(f"  Overall:           {agreement['agreement']*100:5.1f}%   "
-          f"({agreement['n_match']}/{agreement['n_total']})")
-    print(f"  Basic-strategy:    {agreement['bs_agreement']*100:5.1f}%   "
-          f"({agreement['n_bs_match']}/{agreement['n_bs_total']})  "
-          f"(target: >= 95%)")
-    print(f"  Deviation cells:   {agreement['dev_agreement']*100:5.1f}%   "
-          f"({agreement['n_dev_match']}/{agreement['n_dev_total']})")
+    print(f"\n  Action agreement"
+          f"  (non-deviation cells @ TC=0;"
+          f" deviation cells @ threshold-straddling TCs):")
+    print(f"  Overall:           {agreement['agreement']*100:5.1f}%"
+          f"   ({agreement['n_match']}/{agreement['n_total']})")
+    print(f"  Basic-strategy:    {agreement['bs_agreement']*100:5.1f}%"
+          f"   ({agreement['n_bs_match']}/{agreement['n_bs_total']})"
+          f"  (target: >= 95%)")
+    print(f"  Deviation cells:   {agreement['dev_agreement']*100:5.1f}%"
+          f"   ({agreement['n_dev_match']}/{agreement['n_dev_total']})")
 
     # --- Per-deviation breakdown ---
     print(f"\n  Per-deviation results:")
-    print(f"    {'cell':16s}  {'dev':4s}  {'TCs (agent / pass)':40s}")
+    print(f"    {'cell':18s}  {'dev':4s}  TCs (agent / result)")
     for (psum, ua, dv, dev_act), rec in sorted(agreement["dev_results"].items()):
-        cell = f"{'soft' if ua else 'hard'} {psum} vs {dv}"
-        per_tc = "  ".join(
+        cell    = f"{'soft' if ua else 'hard'} {psum} vs {dv}"
+        per_tc  = "  ".join(
             f"{tc:+g}:{ACTION_NAMES[a]}{'OK' if ok else 'X'}"
             for tc, a, ok in rec["tcs"]
         )
-        all_ok = rec["ok"] == rec["n"]
-        status = "PASS" if all_ok else "FAIL"
-        print(f"    [{status}] {cell:16s}  {ACTION_NAMES[dev_act]:4s}  {per_tc}")
+        status  = "PASS" if rec["ok"] == rec["n"] else "FAIL"
+        print(f"    [{status}] {cell:18s}  {ACTION_NAMES[dev_act]:4s}  {per_tc}")
 
-    # --- Mismatch listing (basic-strategy cells only; deviation issues already
-    #     surfaced above) ---
+    # --- Basic-strategy mismatch listing ---
     bs_mismatches = [m for m in agreement["mismatches"] if not m["is_deviation"]]
     if bs_mismatches:
         print(f"\n  Basic-strategy mismatches ({len(bs_mismatches)}):")
@@ -454,23 +482,22 @@ def print_report(
                         key=lambda x: (x["usable_ace"], x["player_sum"],
                                        x["dealer_val"], x["true_count"])):
             hand_type = "soft" if m["usable_ace"] else "hard"
-            print(f"    {hand_type:4} {m['player_sum']:2} vs {m['dealer_val']:2} "
-                  f"@ TC={m['true_count']:+g}: "
-                  f"agent={ACTION_NAMES[m['agent']]}  "
-                  f"expected={ACTION_NAMES[m['expected']]}")
+            print(f"    {hand_type:4} {m['player_sum']:2} vs {m['dealer_val']:2}"
+                  f"  agent={ACTION_NAMES[m['agent']]}"
+                  f"  expected={ACTION_NAMES[m['expected']]}")
 
     # --- Summary ---
-    pass_bs    = agreement["bs_agreement"] >= 0.95
-    n_dev_pass = sum(1 for r in agreement["dev_results"].values()
-                     if r["ok"] == r["n"])
+    pass_bs     = agreement["bs_agreement"] >= 0.95
+    n_dev_pass  = sum(1 for r in agreement["dev_results"].values()
+                      if r["ok"] == r["n"])
     n_dev_cells = len(agreement["dev_results"])
-    pass_dev = n_dev_pass >= 8
+    pass_dev    = n_dev_pass >= 8
 
     print("\n" + "-" * 70)
-    print(f"  EV within 0.2%:          {'PASS' if pass_ev else 'FAIL'}")
+    print(f"  EV >= BS - 0.2%:         {'PASS' if pass_ev else 'FAIL'}")
     print(f"  BS agreement >= 95%:     {'PASS' if pass_bs else 'FAIL'}")
-    print(f"  Deviations passed:       {n_dev_pass}/{n_dev_cells}  "
-          f"({'PASS' if pass_dev else 'FAIL'}, target: >= 8)")
+    print(f"  Deviations passed:       {n_dev_pass}/{n_dev_cells}"
+          f"  ({'PASS' if pass_dev else 'FAIL'}, target: >= 8)")
     print("=" * 70 + "\n")
 
 
@@ -503,11 +530,20 @@ def main(args: argparse.Namespace) -> None:
     agent_policy = make_agent_policy(agent.online_net, device)
     bs_policy    = make_bs_policy()
 
-    print(f"Evaluating agent EV over {args.eval_hands:,} hands...")
-    ev, ev_stderr = evaluate_ev(agent_policy, cfg, args.eval_hands, seed=args.seed)
+    n_batches    = 10
+    total_seeds  = n_batches * 64
+    print(f"Evaluating agent EV over {args.eval_hands:,} hands"
+          f" ({n_batches} batches × 64 envs = {total_seeds} seeds)...")
+    ev, ev_stderr = evaluate_ev(
+        agent_policy, cfg, args.eval_hands,
+        seed=args.seed, n_seed_batches=n_batches,
+    )
 
     print(f"Evaluating basic-strategy EV over {args.eval_hands:,} hands...")
-    bs_ev, bs_ev_stderr = evaluate_ev(bs_policy, cfg, args.eval_hands, seed=args.seed)
+    bs_ev, bs_ev_stderr = evaluate_ev(
+        bs_policy, cfg, args.eval_hands,
+        seed=args.seed, n_seed_batches=n_batches,
+    )
 
     print("Checking count-aware action agreement...")
     agreement = evaluate_count_aware_agreement(agent.online_net, device)

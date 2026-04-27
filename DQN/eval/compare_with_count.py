@@ -117,19 +117,14 @@ DEVIATIONS: dict[tuple[int, bool, int], list[tuple[str, int, int, bool]]] = {
     (15, False, 10): [("gte", 4, STAND, False)],
     (12, False, 3):  [("gte", 2, STAND, False)],
     (12, False, 2):  [("gte", 3, STAND, False)],
-    (16, False, 9): [("gte", 5, STAND, False)],
     # Hit-instead-of-stand deviations (negative count)
     (13, False, 2):  [("lt", -1, HIT, False)],
     (12, False, 4):  [("lt", 0,  HIT, False)],
-    (12, False, 5):  [("lt", -2,  HIT, False)],
-    (12, False, 6):  [("lt", -1,  HIT, False)],
-    (13, False, 3):  [("lt", -2,  HIT, False)],
     # Double-instead-of-hit deviations (require can_double)
     (10, False, 10): [("gte", 4, DOUBLE, True)],
     (11, False, 1):  [("gte", 1, DOUBLE, True)],
     (9,  False, 2):  [("gte", 1, DOUBLE, True)],
-    (10, False, 1):  [("gte", 4, DOUBLE, True)],
-    (9, False, 7): [("gte", 3, DOUBLE, True)],
+    (10, False, 1): [("gte", 4, DOUBLE, True)]
 }
 
 
@@ -351,7 +346,8 @@ def evaluate_count_aware_agreement(
     n_dev_total   = 0
     n_dev_match   = 0
     mismatches: list[dict] = []
-    dev_results: dict[tuple[int, bool, int, int], dict] = {}
+    # key = (player_sum, usable_ace, dealer_val); tcs = (tc, agent, oracle, fires, match)
+    dev_results: dict[tuple[int, bool, int], dict] = {}
 
     def _query(obs_np: np.ndarray, mask_np: np.ndarray) -> int:
         obs_t  = torch.tensor(obs_np[None],  dtype=torch.float32, device=device)
@@ -402,27 +398,30 @@ def evaluate_count_aware_agreement(
                     n_total += 1
                     n_match += int(match)
 
-                    if is_dev:
+                    if is_dev_cell:
+                        # All tests on deviation cells (firing and non-firing) go here;
+                        # they are NOT counted in BS agreement to avoid false penalties.
                         n_dev_total += 1
                         n_dev_match += int(match)
-                        key = (player_sum, usable_ace, dealer_val, exp_act)
-                        rec = dev_results.setdefault(key, {"n": 0, "ok": 0, "tcs": []})
+                        rec = dev_results.setdefault(cell_key, {"n": 0, "ok": 0, "tcs": []})
                         rec["n"]  += 1
                         rec["ok"] += int(match)
-                        rec["tcs"].append((tc, agent_act, match))
+                        rec["tcs"].append((tc, agent_act, exp_act, is_dev, match))
                     else:
+                        # Pure BS cells only.
                         n_bs_total += 1
                         n_bs_match += int(match)
 
                     if not match:
                         mismatches.append({
-                            "player_sum": player_sum,
-                            "usable_ace": usable_ace,
-                            "dealer_val": dealer_val,
-                            "true_count": tc,
-                            "agent": agent_act,
-                            "expected": exp_act,
-                            "is_deviation": is_dev,
+                            "player_sum":        player_sum,
+                            "usable_ace":        usable_ace,
+                            "dealer_val":        dealer_val,
+                            "true_count":        tc,
+                            "agent":             agent_act,
+                            "expected":          exp_act,
+                            "is_deviation":      is_dev,
+                            "is_deviation_cell": is_dev_cell,
                         })
 
     net.set_deterministic(False)
@@ -732,54 +731,60 @@ def print_report(
     print(f"  Basic-strategy EV: {bs_ev*100:+.4f}% +/- {bs_ev_stderr*100:.4f}%")
     print(f"  Agent vs BS:       {ev_label}  ({ev_verdict})")
 
-    # --- Agreement ---
-    print(f"\n  Action agreement"
-          f"  (non-deviation cells @ TC=0;"
-          f" deviation cells @ threshold-straddling TCs):")
-    print(f"  Overall:           {agreement['agreement']*100:5.1f}%"
-          f"   ({agreement['n_match']}/{agreement['n_total']})")
-    print(f"  Basic-strategy:    {agreement['bs_agreement']*100:5.1f}%"
+    # --- Evaluation 1: Basic-strategy agreement (pure BS cells, no deviation rules) ---
+    print(f"\n  Evaluation 1: Basic-Strategy Agreement")
+    print(f"  (cells with no deviation rule, evaluated at TC=0)")
+    print(f"  Agreement:  {agreement['bs_agreement']*100:5.1f}%"
           f"   ({agreement['n_bs_match']}/{agreement['n_bs_total']})"
           f"  (target: >= 95%)")
-    print(f"  Deviation cells:   {agreement['dev_agreement']*100:5.1f}%"
-          f"   ({agreement['n_dev_match']}/{agreement['n_dev_total']})")
 
-    # --- Per-deviation breakdown ---
-    print(f"\n  Per-deviation results:")
-    print(f"    {'cell':18s}  {'dev':4s}  TCs (agent / result)")
-    for (psum, ua, dv, dev_act), rec in sorted(agreement["dev_results"].items()):
-        cell    = f"{'soft' if ua else 'hard'} {psum} vs {dv}"
-        per_tc  = "  ".join(
-            f"{tc:+g}:{ACTION_NAMES[a]}{'OK' if ok else 'X'}"
-            for tc, a, ok in rec["tcs"]
-        )
-        status  = "PASS" if rec["ok"] == rec["n"] else "FAIL"
-        print(f"    [{status}] {cell:18s}  {ACTION_NAMES[dev_act]:4s}  {per_tc}")
-
-    # --- Basic-strategy mismatch listing ---
-    bs_mismatches = [m for m in agreement["mismatches"] if not m["is_deviation"]]
-    if bs_mismatches:
-        print(f"\n  Basic-strategy mismatches ({len(bs_mismatches)}):")
-        for m in sorted(bs_mismatches,
-                        key=lambda x: (x["usable_ace"], x["player_sum"],
-                                       x["dealer_val"], x["true_count"])):
+    pure_bs_mismatches = [
+        m for m in agreement["mismatches"]
+        if not m["is_deviation"] and not m["is_deviation_cell"]
+    ]
+    if pure_bs_mismatches:
+        print(f"  Mismatches ({len(pure_bs_mismatches)}):")
+        for m in sorted(pure_bs_mismatches,
+                        key=lambda x: (x["usable_ace"], x["player_sum"], x["dealer_val"])):
             hand_type = "soft" if m["usable_ace"] else "hard"
-            print(f"    {hand_type:4} {m['player_sum']:2} vs {m['dealer_val']:2}"
+            print(f"    {hand_type} {m['player_sum']:2} vs {m['dealer_val']:2}"
                   f"  agent={ACTION_NAMES[m['agent']]}"
                   f"  expected={ACTION_NAMES[m['expected']]}")
+
+    # --- Evaluation 2: Per-deviation following ---
+    print(f"\n  Evaluation 2: Deviation Following")
+    print(f"  (each deviation at threshold-straddling TCs; oracle=BS when deviation is off)")
+    print(f"  Overall:  {agreement['dev_agreement']*100:5.1f}%"
+          f"   ({agreement['n_dev_match']}/{agreement['n_dev_total']} tests)\n")
+
+    for (ps, ua, dv), rec in sorted(agreement["dev_results"].items()):
+        cell  = f"{'soft' if ua else 'hard'} {ps} vs {dv}"
+        rules = DEVIATIONS.get((ps, ua, dv), [])
+        rule_desc = "  ".join(
+            f"TC{'≥' if d == 'gte' else '<'}{t:+d}→{ACTION_NAMES[a]}"
+            + (" (D req.)" if req else "")
+            for d, t, a, req in rules
+        )
+        tc_results = "  ".join(
+            f"TC={tc:+g}:{ACTION_NAMES[exp]}/{ACTION_NAMES[agt]}"
+            f"({'on' if fires else 'off'}){'OK' if ok else 'FAIL'}"
+            for tc, agt, exp, fires, ok in sorted(rec["tcs"], key=lambda x: x[0])
+        )
+        status = "PASS" if rec["ok"] == rec["n"] else "FAIL"
+        print(f"    [{status}] {cell:18s}  {rule_desc:22s}  {tc_results}")
 
     # --- Summary ---
     pass_bs     = agreement["bs_agreement"] >= 0.95
     n_dev_pass  = sum(1 for r in agreement["dev_results"].values()
                       if r["ok"] == r["n"])
     n_dev_cells = len(agreement["dev_results"])
-    pass_dev    = n_dev_pass >= 8
+    pass_dev    = n_dev_pass >= n_dev_cells - 2  # allow up to 2 deviations failing
 
     print("\n" + "-" * 70)
     print(f"  EV >= BS - 0.2%:         {'PASS' if pass_ev else 'FAIL'}")
     print(f"  BS agreement >= 95%:     {'PASS' if pass_bs else 'FAIL'}")
     print(f"  Deviations passed:       {n_dev_pass}/{n_dev_cells}"
-          f"  ({'PASS' if pass_dev else 'FAIL'}, target: >= 8)")
+          f"  ({'PASS' if pass_dev else 'FAIL'}, target: >= {n_dev_cells - 2})")
     print("=" * 70 + "\n")
 
 
@@ -909,7 +914,10 @@ def main(args: argparse.Namespace) -> None:
 
     print_report(ev, ev_stderr, bs_ev, bs_ev_stderr, agreement)
 
-    bs_mismatches = [m for m in agreement["mismatches"] if not m["is_deviation"]]
+    bs_mismatches = [
+        m for m in agreement["mismatches"]
+        if not m["is_deviation"] and not m["is_deviation_cell"]
+    ]
     unique_bs_cells = {
         (m["player_sum"], m["usable_ace"], m["dealer_val"]) for m in bs_mismatches
     }

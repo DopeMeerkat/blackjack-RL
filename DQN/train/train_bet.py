@@ -282,6 +282,7 @@ def train(args: argparse.Namespace) -> None:
                                   float(np.mean(recent_losses)), hands_played)
             writer.add_scalar("train/replay_size",
                               len(bet_agent.replay), hands_played)
+            writer.add_scalar("train/epsilon", bet_agent.epsilon, hands_played)
             if recent_multipliers:
                 writer.add_scalar("train/avg_multiplier",
                                   float(np.mean(recent_multipliers)),

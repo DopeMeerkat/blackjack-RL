@@ -80,7 +80,9 @@ bet_agent:
   bet_lr: 1.0e-4
   bet_batch_size: 1024
   bet_replay_cap: 500_000
-  bet_temperature: 0.25
+  bet_eps_start: 1.0
+  bet_eps_end: 0.05
+  bet_eps_decay_hands: 10_000_000
 
 eps_greedy:                       # used only for A/B comparison (Milestone 5)
   eps_start: 1.0

@@ -122,13 +122,15 @@ class TestBetReplayBuffer:
 
 class _BetAgentFixture:
     _CFG = {
-        "bet_obs_dim":      12,
-        "bet_hidden":       32,
-        "bet_actions":      5,
-        "bet_lr":           1e-3,
-        "bet_batch_size":   32,
-        "bet_replay_cap":   1_000,
-        "bet_temperature":  1.0,
+        "bet_obs_dim":        12,
+        "bet_hidden":         32,
+        "bet_actions":        5,
+        "bet_lr":             1e-3,
+        "bet_batch_size":     32,
+        "bet_replay_cap":     1_000,
+        "bet_eps_start":      1.0,
+        "bet_eps_end":        0.05,
+        "bet_eps_decay_hands": 10_000,
     }
 
     def _make(self):
@@ -143,6 +145,30 @@ class _BetAgentFixture:
             agent.add_transition(self._obs(), int(np.random.randint(5)), float(np.random.randn()))
 
 
+class TestBetAgentEpsilon(_BetAgentFixture):
+    def test_epsilon_starts_at_eps_start(self):
+        agent = self._make()
+        assert abs(agent.epsilon - self._CFG["bet_eps_start"]) < 1e-6
+
+    def test_epsilon_decreases_with_hands(self):
+        agent = self._make()
+        eps0 = agent.epsilon
+        self._fill(agent, n=100)
+        assert agent.epsilon < eps0
+
+    def test_epsilon_floors_at_eps_end(self):
+        agent = self._make()
+        # Simulate far more hands than the decay horizon.
+        self._fill(agent, n=self._CFG["bet_eps_decay_hands"] * 2)
+        assert abs(agent.epsilon - self._CFG["bet_eps_end"]) < 1e-6
+
+    def test_epsilon_linear_midpoint(self):
+        agent = self._make()
+        self._fill(agent, n=self._CFG["bet_eps_decay_hands"] // 2)
+        expected = (self._CFG["bet_eps_start"] + self._CFG["bet_eps_end"]) / 2
+        assert abs(agent.epsilon - expected) < 1e-5
+
+
 class TestBetAgentActions(_BetAgentFixture):
     def test_select_action_range(self):
         agent = self._make()
@@ -150,11 +176,12 @@ class TestBetAgentActions(_BetAgentFixture):
             a = agent.select_action(self._obs())
             assert 0 <= a < 5
 
-    def test_select_action_greedy_range(self):
+    def test_select_action_is_deterministic(self):
         agent = self._make()
-        for _ in range(20):
-            a = agent.select_action_greedy(self._obs())
-            assert 0 <= a < 5
+        obs = self._obs()
+        a1 = agent.select_action(obs)
+        a2 = agent.select_action(obs)
+        assert a1 == a2
 
     def test_select_actions_batch_shape(self):
         agent = self._make()
@@ -168,23 +195,32 @@ class TestBetAgentActions(_BetAgentFixture):
         actions = agent.select_actions_batch(obs_batch, greedy=True)
         assert actions.shape == (16,)
 
-    def test_greedy_is_deterministic(self):
+    def test_select_actions_batch_valid_range(self):
         agent = self._make()
-        obs = self._obs()
-        a1 = agent.select_action_greedy(obs)
-        a2 = agent.select_action_greedy(obs)
-        assert a1 == a2
+        obs_batch = np.random.randn(32, 12).astype(np.float32)
+        for greedy in (True, False):
+            actions = agent.select_actions_batch(obs_batch, greedy=greedy)
+            assert actions.min() >= 0
+            assert actions.max() < 5
 
-    def test_low_temperature_is_nearly_greedy(self):
-        """With temperature→0 softmax should almost always pick the argmax."""
+    def test_greedy_batch_is_deterministic(self):
+        agent = self._make()
+        obs_batch = np.random.randn(16, 12).astype(np.float32)
+        a1 = agent.select_actions_batch(obs_batch, greedy=True)
+        a2 = agent.select_actions_batch(obs_batch, greedy=True)
+        np.testing.assert_array_equal(a1, a2)
+
+    def test_eps1_exploration_is_uniform(self):
+        """At eps=1 all actions should appear across a large batch."""
         from agent.bet_agent import BetAgent
         cfg = dict(self._CFG)
-        cfg["bet_temperature"] = 1e-6
+        cfg["bet_eps_start"] = 1.0
+        cfg["bet_eps_end"]   = 1.0   # keep at 1 regardless of hands
         agent = BetAgent(cfg, torch.device("cpu"))
-        obs = self._obs()
-        greedy = agent.select_action_greedy(obs)
-        sampled = [agent.select_action(obs) for _ in range(20)]
-        assert all(a == greedy for a in sampled)
+        obs_batch = np.random.randn(1000, 12).astype(np.float32)
+        actions = agent.select_actions_batch(obs_batch, greedy=False)
+        unique = set(actions.tolist())
+        assert len(unique) == 5, f"Expected all 5 actions, got {unique}"
 
 
 class TestBetAgentTraining(_BetAgentFixture):
@@ -215,6 +251,12 @@ class TestBetAgentTraining(_BetAgentFixture):
         agent.train_step()
         assert agent._train_steps == before + 1
 
+    def test_add_transition_increments_hands_seen(self):
+        agent = self._make()
+        assert agent._hands_seen == 0
+        agent.add_transition(self._obs(), 0, 0.5)
+        assert agent._hands_seen == 1
+
 
 class TestBetAgentCheckpoint(_BetAgentFixture):
     def test_state_dict_roundtrip(self):
@@ -228,8 +270,8 @@ class TestBetAgentCheckpoint(_BetAgentFixture):
         agent2.load_state_dict(sd)
 
         obs = self._obs()
-        a1 = agent.select_action_greedy(obs)
-        a2 = agent2.select_action_greedy(obs)
+        a1 = agent.select_action(obs)
+        a2 = agent2.select_action(obs)
         assert a1 == a2
 
     def test_state_dict_has_expected_keys(self):
@@ -238,6 +280,7 @@ class TestBetAgentCheckpoint(_BetAgentFixture):
         assert "net"         in sd
         assert "optimizer"   in sd
         assert "train_steps" in sd
+        assert "hands_seen"  in sd
 
     def test_train_steps_preserved(self):
         agent = self._make()
@@ -250,3 +293,13 @@ class TestBetAgentCheckpoint(_BetAgentFixture):
         agent2 = BetAgent(self._CFG, torch.device("cpu"))
         agent2.load_state_dict(sd)
         assert agent2._train_steps == 3
+
+    def test_hands_seen_preserved(self):
+        agent = self._make()
+        self._fill(agent, n=42)
+        sd = agent.state_dict()
+
+        from agent.bet_agent import BetAgent
+        agent2 = BetAgent(self._CFG, torch.device("cpu"))
+        agent2.load_state_dict(sd)
+        assert agent2._hands_seen == 42

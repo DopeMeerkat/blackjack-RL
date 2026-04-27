@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -283,6 +284,26 @@ def make_agent_policy(net: BlackjackNet, device: torch.device):
     return policy_fn
 
 
+def make_oracle_policy():
+    """Batched oracle policy using expected_action() (BS + Illustrious-18 deviations)."""
+    def policy_fn(obs_batch: np.ndarray, mask_batch: np.ndarray) -> np.ndarray:
+        k = len(obs_batch)
+        actions = np.empty(k, dtype=np.int32)
+        for i in range(k):
+            ps, ua, dv, cd, cs, pv = _decode_obs(obs_batch[i], mask_batch[i])
+            tc = float(obs_batch[i][25] * 5.0)
+            a, _ = expected_action(
+                player_sum=ps, usable_ace=ua, dealer_val=dv,
+                can_double=cd, can_split=cs, pair_value=pv,
+                true_count=tc,
+            )
+            if not mask_batch[i][a]:
+                a = int(np.argmax(mask_batch[i].astype(np.float32)))
+            actions[i] = a
+        return actions
+    return policy_fn
+
+
 # ---------------------------------------------------------------------------
 # Count-aware action agreement
 # ---------------------------------------------------------------------------
@@ -422,6 +443,267 @@ def evaluate_count_aware_agreement(
 
 
 # ---------------------------------------------------------------------------
+# Learned deviation analysis (Test 3)
+# ---------------------------------------------------------------------------
+
+_TC_SWEEP = list(range(-5, 6))  # integer TCs −5..+5
+
+
+def count_sweep_bs_cells(
+    net: BlackjackNet,
+    device: torch.device,
+    cells: set[tuple[int, bool, int]],
+    decks_remaining: float = 3.0,
+) -> dict[tuple[int, bool, int], dict[int, dict]]:
+    """Query the agent at each integer TC in [−5, +5] for every cell.
+
+    Uses can_double=True, can_split=False to match Test 2 conditions.
+    Returns {cell: {tc: {"agent": int, "oracle": int, "match": bool}}}.
+    """
+    if not cells:
+        return {}
+
+    net.set_deterministic(True)
+    mask = np.array([True, True, True, False], dtype=bool)
+    result: dict = {}
+
+    for (player_sum, usable_ace, dealer_val) in sorted(cells):
+        cell_map: dict[int, dict] = {}
+        for tc in _TC_SWEEP:
+            obs = encode_state(
+                player_sum=player_sum,
+                usable_ace=usable_ace,
+                dealer_upcard_rank=dealer_val,
+                is_pair=False,
+                pair_rank=None,
+                can_double=True,
+                can_split=False,
+                true_count=float(tc),
+                decks_remaining=decks_remaining,
+            )
+            obs_t  = torch.tensor(obs[None],  dtype=torch.float32, device=device)
+            mask_t = torch.tensor(mask[None], dtype=torch.bool,    device=device)
+            with torch.no_grad():
+                play_q = net(obs_t).clone()
+                play_q[~mask_t] = -1e9
+            agent_act = int(play_q.argmax(dim=1).item())
+
+            oracle_act, _ = expected_action(
+                player_sum=player_sum,
+                usable_ace=usable_ace,
+                dealer_val=dealer_val,
+                can_double=True,
+                can_split=False,
+                pair_value=None,
+                true_count=float(tc),
+            )
+            cell_map[tc] = {
+                "agent":  agent_act,
+                "oracle": oracle_act,
+                "match":  agent_act == oracle_act,
+            }
+        result[(player_sum, usable_ace, dealer_val)] = cell_map
+
+    net.set_deterministic(False)
+    return result
+
+
+def classify_cell_sensitivity(tc_map: dict[int, dict]) -> dict:
+    """Classify whether the agent is count-sensitive for this cell.
+
+    count-sensitive = agent takes at least 2 distinct actions across TCs.
+    Deviant TCs are those where agent != oracle. Returns classification dict
+    with tc_lo/tc_hi bounding the deviant range for use in simulation.
+    """
+    agent_actions = {tc: rec["agent"] for tc, rec in tc_map.items()}
+    deviant_tcs   = sorted(tc for tc, rec in tc_map.items() if not rec["match"])
+    is_count_sensitive = len(set(agent_actions.values())) >= 2
+
+    if not is_count_sensitive or not deviant_tcs:
+        return {
+            "is_count_sensitive":           False,
+            "deviant_tcs":                  deviant_tcs,
+            "deviant_action":               None,
+            "oracle_action_at_deviant_tcs": None,
+            "tc_lo":                        None,
+            "tc_hi":                        None,
+        }
+
+    deviant_action = Counter(
+        tc_map[tc]["agent"] for tc in deviant_tcs
+    ).most_common(1)[0][0]
+    oracle_action_at_deviant_tcs = Counter(
+        tc_map[tc]["oracle"] for tc in deviant_tcs
+    ).most_common(1)[0][0]
+
+    return {
+        "is_count_sensitive":           True,
+        "deviant_tcs":                  deviant_tcs,
+        "deviant_action":               deviant_action,
+        "oracle_action_at_deviant_tcs": oracle_action_at_deviant_tcs,
+        "tc_lo":                        float(min(deviant_tcs)),
+        "tc_hi":                        float(max(deviant_tcs)),
+    }
+
+
+def simulate_action_at_cell(
+    target_cell: tuple[int, bool, int],
+    forced_action: int,
+    tc_lo: float,
+    tc_hi: float,
+    cfg: dict,
+    n_hands: int,
+    seed: int = 0,
+    num_envs: int = 64,
+    n_seed_batches: int = 10,
+) -> dict:
+    """Empirically estimate EV and win-rate of forced_action at target_cell when TC ∈ [tc_lo, tc_hi].
+
+    Intercepts play-phase decisions at the target cell + TC and forces the
+    specified action; uses oracle for all other decisions.  Tracks only hand
+    rewards for hands that visited the target cell in the TC range.
+
+    Called twice per count-sensitive cell — once with the agent's deviant action
+    and once with the oracle's action — using the same seed for comparability.
+
+    Note: episode reward covers all sub-hands from splits; if the target cell
+    is visited during one sub-hand of a split, the full episode reward is
+    attributed to that target encounter.
+    """
+    oracle_policy = make_oracle_policy()
+
+    def _oracle_single(obs_i: np.ndarray, mask_i: np.ndarray) -> int:
+        return int(oracle_policy(obs_i[None], mask_i[None])[0])
+
+    target_ps, target_ua, target_dv = target_cell
+    all_target_rewards: list[float] = []
+    hands_per_batch = n_hands // n_seed_batches
+
+    for batch in range(n_seed_batches):
+        batch_seeds = [seed + batch * num_envs + i for i in range(num_envs)]
+        vec_env = VecBlackjackEnv(num_envs, cfg, seeds=batch_seeds)
+        obs, masks, infos = vec_env.reset()
+
+        hit_target = [False] * num_envs
+        hands_done = 0
+        batch_target_rewards: list[float] = []
+
+        while hands_done < hands_per_batch:
+            actions = np.zeros(num_envs, dtype=np.int32)
+
+            for i in range(num_envs):
+                if infos[i]["phase"] == "bet":
+                    actions[i] = 0
+                else:
+                    ps, ua, dv, *_ = _decode_obs(obs[i], masks[i])
+                    tc = round(float(obs[i][25] * 5.0))  # round avoids fp jitter
+
+                    if ps == target_ps and ua == target_ua and dv == target_dv \
+                            and tc_lo <= tc <= tc_hi:
+                        hit_target[i] = True
+                        actions[i] = (forced_action if masks[i][forced_action]
+                                      else _oracle_single(obs[i], masks[i]))
+                    else:
+                        actions[i] = _oracle_single(obs[i], masks[i])
+
+            obs, masks, rews, dones, infos = vec_env.step(actions)
+
+            for i in range(num_envs):
+                if dones[i]:
+                    if hit_target[i]:
+                        batch_target_rewards.append(float(rews[i]))
+                    hit_target[i] = False
+                    hands_done += 1
+                    if hands_done >= hands_per_batch:
+                        break
+                    obs_i, mask_i, info_i = vec_env.reset_at(i)
+                    obs[i]   = obs_i
+                    masks[i] = mask_i
+                    infos[i] = info_i
+
+        all_target_rewards.extend(batch_target_rewards)
+
+    if not all_target_rewards:
+        return {"ev": float("nan"), "ev_stderr": float("nan"),
+                "win_rate": float("nan"), "n_samples": 0}
+
+    arr = np.array(all_target_rewards, dtype=np.float64)
+    return {
+        "ev":        float(arr.mean()),
+        "ev_stderr": float(arr.std() / np.sqrt(len(arr))),
+        "win_rate":  float(np.mean(arr > 0)),
+        "n_samples": len(arr),
+    }
+
+
+def evaluate_learned_deviations(
+    net: BlackjackNet,
+    device: torch.device,
+    cfg: dict,
+    bs_mismatches: list[dict],
+    n_hands: int,
+    seed: int = 0,
+    n_seed_batches: int = 10,
+) -> list[dict]:
+    """Analyse BS-cell mismatches from Test 2 for count-sensitivity and EV.
+
+    Steps:
+      1. Sweep each unique mismatch cell at integer TCs −5..+5.
+      2. Classify each cell as count-sensitive or count-insensitive.
+      3. For count-sensitive cells: run two simulations (agent vs oracle action)
+         in the deviant TC range and collect EV / win-rate.
+    """
+    if not bs_mismatches:
+        return []
+
+    unique_cells: set[tuple[int, bool, int]] = {
+        (m["player_sum"], m["usable_ace"], m["dealer_val"])
+        for m in bs_mismatches
+    }
+
+    tc_maps = count_sweep_bs_cells(net, device, unique_cells)
+
+    analyses: list[dict] = []
+    for cell in sorted(unique_cells):
+        tc_map         = tc_maps[cell]
+        classification = classify_cell_sensitivity(tc_map)
+        record: dict   = {"cell": cell, "tc_map": tc_map, **classification}
+
+        if not classification["is_count_sensitive"]:
+            record["agent_action"]  = tc_map[0]["agent"]
+            record["oracle_action"] = tc_map[0]["oracle"]
+            analyses.append(record)
+            continue
+
+        dev_action    = classification["deviant_action"]
+        oracle_action = classification["oracle_action_at_deviant_tcs"]
+        tc_lo         = classification["tc_lo"]
+        tc_hi         = classification["tc_hi"]
+        ps, ua, dv    = cell
+        hand_type     = "soft" if ua else "hard"
+        print(f"  Simulating {hand_type} {ps} vs {dv}:"
+              f" agent={ACTION_NAMES[dev_action]}"
+              f" vs oracle={ACTION_NAMES[oracle_action]}"
+              f" at TC in [{tc_lo:+.0f}, {tc_hi:+.0f}]...")
+
+        record["agent_sim"] = simulate_action_at_cell(
+            target_cell=cell, forced_action=dev_action,
+            tc_lo=tc_lo, tc_hi=tc_hi,
+            cfg=cfg, n_hands=n_hands, seed=seed,
+            num_envs=64, n_seed_batches=n_seed_batches,
+        )
+        record["oracle_sim"] = simulate_action_at_cell(
+            target_cell=cell, forced_action=oracle_action,
+            tc_lo=tc_lo, tc_hi=tc_hi,
+            cfg=cfg, n_hands=n_hands, seed=seed,
+            num_envs=64, n_seed_batches=n_seed_batches,
+        )
+        analyses.append(record)
+
+    return analyses
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -501,6 +783,84 @@ def print_report(
     print("=" * 70 + "\n")
 
 
+def print_learned_deviation_report(analyses: list[dict]) -> None:
+    print("\nTest 3: Learned Deviation Analysis")
+    print("=" * 70)
+
+    if not analyses:
+        print("  No BS mismatches — nothing to analyze.")
+        print("=" * 70 + "\n")
+        return
+
+    count_insensitive = [a for a in analyses if not a["is_count_sensitive"]]
+    count_sensitive   = [a for a in analyses if a["is_count_sensitive"]]
+    print(f"  BS-cell mismatches from Test 2: {len(analyses)} unique cell(s)\n")
+
+    if count_insensitive:
+        print(f"  [Count-insensitive: {len(count_insensitive)} cell(s)]")
+        for a in count_insensitive:
+            ps, ua, dv = a["cell"]
+            hand_type  = "soft" if ua else "hard"
+            print(f"    {hand_type} {ps} vs {dv}"
+                  f"  ->  agent: {ACTION_NAMES[a['agent_action']]}"
+                  f"  oracle: {ACTION_NAMES[a['oracle_action']]}"
+                  f"  (consistent across all TCs, likely error)")
+        print()
+
+    if count_sensitive:
+        print(f"  [Count-sensitive: {len(count_sensitive)} cell(s)]")
+        for a in count_sensitive:
+            ps, ua, dv = a["cell"]
+            hand_type  = "soft" if ua else "hard"
+            tc_map     = a["tc_map"]
+
+            print(f"\n  {hand_type} {ps} vs {dv}")
+            print("  TC:    " + "  ".join(f"{tc:+3d}" for tc in _TC_SWEEP))
+            print("  agent: " + "  ".join(
+                f"  {ACTION_NAMES[tc_map[tc]['agent']]}" for tc in _TC_SWEEP
+            ))
+            print("  oracle:" + "  ".join(
+                f"  {ACTION_NAMES[tc_map[tc]['oracle']]}" for tc in _TC_SWEEP
+            ))
+
+            dev_action    = a["deviant_action"]
+            oracle_action = a["oracle_action_at_deviant_tcs"]
+            tc_lo, tc_hi  = a["tc_lo"], a["tc_hi"]
+            tc_range_str  = (f"TC = {tc_lo:+.0f}" if tc_lo == tc_hi
+                             else f"TC in [{tc_lo:+.0f}, {tc_hi:+.0f}]")
+            print(f"  Deviation: agent {ACTION_NAMES[dev_action]} at {tc_range_str};"
+                  f" oracle {ACTION_NAMES[oracle_action]} in that range")
+
+            agent_sim  = a["agent_sim"]
+            oracle_sim = a["oracle_sim"]
+
+            if agent_sim["n_samples"] == 0:
+                print("  Simulation: cell never encountered"
+                      " (TC range too extreme or cell extremely rare)")
+            else:
+                n = agent_sim["n_samples"]
+                print(f"  Simulation ({tc_range_str}, {n:,} target hands):")
+                print(f"    agent  {ACTION_NAMES[dev_action]}:"
+                      f"  EV = {agent_sim['ev']*100:+.3f}%"
+                      f" ± {agent_sim['ev_stderr']*100:.3f}%"
+                      f"   win rate: {agent_sim['win_rate']*100:.1f}%")
+                print(f"    oracle {ACTION_NAMES[oracle_action]}:"
+                      f"  EV = {oracle_sim['ev']*100:+.3f}%"
+                      f" ± {oracle_sim['ev_stderr']*100:.3f}%"
+                      f"   win rate: {oracle_sim['win_rate']*100:.1f}%")
+                delta_ev    = agent_sim["ev"] - oracle_sim["ev"]
+                combined_se = np.sqrt(
+                    agent_sim["ev_stderr"]**2 + oracle_sim["ev_stderr"]**2
+                )
+                print(f"    delta = {delta_ev*100:+.3f}% ± {combined_se*100:.3f}%")
+                verdict = ("PLAUSIBLE LEARNED DEVIATION"
+                           if delta_ev >= -2.0 * combined_se
+                           else "LIKELY ERROR")
+                print(f"    ->  {verdict}")
+
+    print("\n" + "=" * 70 + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -514,7 +874,6 @@ def main(args: argparse.Namespace) -> None:
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt["config"]
     print("  Using config from checkpoint.")
-    print(cfg)
 
     agent = DQNAgent(
         net_config=net_config(cfg),
@@ -549,6 +908,23 @@ def main(args: argparse.Namespace) -> None:
     agreement = evaluate_count_aware_agreement(agent.online_net, device)
 
     print_report(ev, ev_stderr, bs_ev, bs_ev_stderr, agreement)
+
+    bs_mismatches = [m for m in agreement["mismatches"] if not m["is_deviation"]]
+    unique_bs_cells = {
+        (m["player_sum"], m["usable_ace"], m["dealer_val"]) for m in bs_mismatches
+    }
+    print(f"Running learned deviation analysis"
+          f" ({len(unique_bs_cells)} unique BS-mismatch cell(s))...")
+    analyses = evaluate_learned_deviations(
+        net=agent.online_net,
+        device=device,
+        cfg=cfg,
+        bs_mismatches=bs_mismatches,
+        n_hands=args.eval_hands,
+        seed=args.seed,
+        n_seed_batches=n_batches,
+    )
+    print_learned_deviation_report(analyses)
 
 
 def parse_args() -> argparse.Namespace:

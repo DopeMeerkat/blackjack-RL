@@ -111,20 +111,25 @@ def _dealer_upcard_val(rank: int) -> int:
 # direction "lt":  deviate when TC <  threshold
 # ---------------------------------------------------------------------------
 
-DEVIATIONS: dict[tuple[int, bool, int], list[tuple[str, int, int, bool]]] = {
+DEVIATIONS: dict[tuple[int, bool, int], list[tuple[int, str, int, int, bool]]] = {
     # Stand-instead-of-hit deviations
-    (16, False, 10): [("gte", 0, STAND, False,)],
-    (15, False, 10): [("gte", 4, STAND, False)],
-    (12, False, 3):  [("gte", 2, STAND, False)],
-    (12, False, 2):  [("gte", 3, STAND, False)],
+    (16, False, 10): [(2, "gte", 0, STAND, False,)],
+    (15, False, 10): [(3, "gte", 4, STAND, False)],
+    (12, False, 3):  [(7, "gte", 2, STAND, False)],
+    (12, False, 2):  [(8, "gte", 3, STAND, False)],
+    (16, False, 9): [(13, "gte", 5, STAND, False)],
     # Hit-instead-of-stand deviations (negative count)
-    (13, False, 2):  [("lt", -1, HIT, False)],
-    (12, False, 4):  [("lt", 0,  HIT, False)],
+    (13, False, 2):  [(14, "lt", -1, HIT, False)],
+    (12, False, 4):  [(15, "lt", 0,  HIT, False)],
+    (12, False, 5):  [(16, "lt", -2,  HIT, False)],
+    (12, False, 6):  [(17, "lt", -1,  HIT, False)],
+    (13, False, 3):  [(18, "lt", -2,  HIT, False)],
     # Double-instead-of-hit deviations (require can_double)
-    (10, False, 10): [("gte", 4, DOUBLE, True)],
-    (11, False, 1):  [("gte", 1, DOUBLE, True)],
-    (9,  False, 2):  [("gte", 1, DOUBLE, True)],
-    (10, False, 1): [("gte", 4, DOUBLE, True)]
+    (10, False, 10): [(6, "gte", 4, DOUBLE, True)],
+    (11, False, 1):  [(9, "gte", 1, DOUBLE, True)],
+    (9,  False, 2):  [(10, "gte", 1, DOUBLE, True)],
+    (10, False, 1): [(11, "gte", 4, DOUBLE, True)],
+    (9, False, 7): [(12, "gte", 3, DOUBLE, True)],
 }
 
 
@@ -138,8 +143,8 @@ def deviation_action(
     """Return the deviation action if one applies at this (cell, TC), else None."""
     rules = DEVIATIONS.get((player_sum, usable_ace, dealer_val))
     if rules is None:
-        return None
-    for direction, threshold, dev_act, requires_double in rules:
+        return 0, None
+    for idx, direction, threshold, dev_act, requires_double in rules:
         if requires_double and not can_double:
             continue
         fires = (
@@ -147,8 +152,8 @@ def deviation_action(
             (direction == "lt"  and true_count <  threshold)
         )
         if fires:
-            return dev_act
-    return None
+            return idx, dev_act
+    return 0, None
 
 
 def expected_action(
@@ -159,14 +164,14 @@ def expected_action(
     can_split: bool,
     pair_value: int | None,
     true_count: float,
-) -> tuple[int, bool]:
-    """Return (expected_action, is_deviation).
+) -> tuple[int, int, bool]:
+    """Return (idx of deviation, expected_action, is_deviation).
 
     is_deviation is True when a deviation rule fires for this (cell, TC).
     """
-    dev = deviation_action(player_sum, usable_ace, dealer_val, true_count, can_double)
+    idx, dev = deviation_action(player_sum, usable_ace, dealer_val, true_count, can_double)
     if dev is not None:
-        return dev, True
+        return idx, dev, True
     bs = basic_strategy_action(
         player_sum=player_sum,
         usable_ace=usable_ace,
@@ -175,7 +180,7 @@ def expected_action(
         can_split=can_split,
         pair_value=pair_value,
     )
-    return bs, False
+    return 0, bs, False
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +289,11 @@ def make_oracle_policy():
     def policy_fn(obs_batch: np.ndarray, mask_batch: np.ndarray) -> np.ndarray:
         k = len(obs_batch)
         actions = np.empty(k, dtype=np.int32)
+        idxs = np.empty(k, dtype=np.int32)
         for i in range(k):
             ps, ua, dv, cd, cs, pv = _decode_obs(obs_batch[i], mask_batch[i])
             tc = float(obs_batch[i][25] * 5.0)
-            a, _ = expected_action(
+            idx, a, _ = expected_action(
                 player_sum=ps, usable_ace=ua, dealer_val=dv,
                 can_double=cd, can_split=cs, pair_value=pv,
                 true_count=tc,
@@ -295,6 +301,7 @@ def make_oracle_policy():
             if not mask_batch[i][a]:
                 a = int(np.argmax(mask_batch[i].astype(np.float32)))
             actions[i] = a
+            idxs[i] = idx
         return actions
     return policy_fn
 
@@ -314,7 +321,7 @@ def _deviation_test_tcs(cell_key: tuple) -> list[float]:
     """
     rules = DEVIATIONS[cell_key]
     tcs: set[float] = set()
-    for _, threshold, _, _ in rules:
+    for _, _, threshold, _, _ in rules:
         tcs.add(float(threshold - 1))
         tcs.add(float(threshold))
     return sorted(tcs)
@@ -384,7 +391,7 @@ def evaluate_count_aware_agreement(
 
                     agent_act = _query(obs, mask)
 
-                    exp_act, is_dev = expected_action(
+                    idx, exp_act, is_dev = expected_action(
                         player_sum=player_sum,
                         usable_ace=usable_ace,
                         dealer_val=dealer_val,
@@ -421,6 +428,7 @@ def evaluate_count_aware_agreement(
                             "agent":             agent_act,
                             "expected":          exp_act,
                             "is_deviation":      is_dev,
+                            "is_deviation_idx":  idx,
                             "is_deviation_cell": is_dev_cell,
                         })
 
@@ -487,7 +495,7 @@ def count_sweep_bs_cells(
                 play_q[~mask_t] = -1e9
             agent_act = int(play_q.argmax(dim=1).item())
 
-            oracle_act, _ = expected_action(
+            _, oracle_act, _ = expected_action(
                 player_sum=player_sum,
                 usable_ace=usable_ace,
                 dealer_val=dealer_val,
@@ -763,7 +771,7 @@ def print_report(
         rule_desc = "  ".join(
             f"TC{'≥' if d == 'gte' else '<'}{t:+d}→{ACTION_NAMES[a]}"
             + (" (D req.)" if req else "")
-            for d, t, a, req in rules
+            for idx, d, t, a, req in rules
         )
         tc_results = "  ".join(
             f"TC={tc:+g}:{ACTION_NAMES[exp]}/{ACTION_NAMES[agt]}"
@@ -896,16 +904,16 @@ def main(args: argparse.Namespace) -> None:
 
     n_batches    = 10
     total_seeds  = n_batches * 64
-    print(f"Evaluating agent EV over {args.eval_hands:,} hands"
+    print(f"Evaluating agent EV over {args.eval_hands_bs:,} hands"
           f" ({n_batches} batches × 64 envs = {total_seeds} seeds)...")
     ev, ev_stderr = evaluate_ev(
-        agent_policy, cfg, args.eval_hands,
+        agent_policy, cfg, args.eval_hands_bs,
         seed=args.seed, n_seed_batches=n_batches,
     )
 
-    print(f"Evaluating basic-strategy EV over {args.eval_hands:,} hands...")
+    print(f"Evaluating basic-strategy EV over {args.eval_hands_bs:,} hands...")
     bs_ev, bs_ev_stderr = evaluate_ev(
-        bs_policy, cfg, args.eval_hands,
+        bs_policy, cfg, args.eval_hands_bs,
         seed=args.seed, n_seed_batches=n_batches,
     )
 
@@ -921,14 +929,14 @@ def main(args: argparse.Namespace) -> None:
     unique_bs_cells = {
         (m["player_sum"], m["usable_ace"], m["dealer_val"]) for m in bs_mismatches
     }
-    print(f"Running learned deviation analysis"
+    print(f"Running learned deviation analysis over {args.eval_hands_dev} hands"
           f" ({len(unique_bs_cells)} unique BS-mismatch cell(s))...")
     analyses = evaluate_learned_deviations(
         net=agent.online_net,
         device=device,
         cfg=cfg,
         bs_mismatches=bs_mismatches,
-        n_hands=args.eval_hands,
+        n_hands=args.eval_hands_dev,
         seed=args.seed,
         n_seed_batches=n_batches,
     )
@@ -941,7 +949,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--checkpoint", required=True,
                    help="Path to checkpoint .pt file")
-    p.add_argument("--eval-hands", type=int, default=1_000_000)
+    p.add_argument("--eval-hands-bs", type=int, default=10_000_000)
+    p.add_argument("--eval-hands-dev", type=int, default=1_000_000)
     p.add_argument("--seed",       type=int, default=99999)
     p.add_argument("--cpu",        action="store_true")
     return p.parse_args()

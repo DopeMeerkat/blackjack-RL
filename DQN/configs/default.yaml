@@ -75,12 +75,12 @@ curriculum:
 
 bet_agent:
   bet_obs_dim: 12
-  bet_hidden: 64
+  bet_hidden: 128
   bet_actions: 5
-  bet_lr: 1.0e-3
-  bet_batch_size: 256
-  bet_replay_cap: 100_000
-  bet_temperature: 1.0
+  bet_lr: 1.0e-4
+  bet_batch_size: 1024
+  bet_replay_cap: 500_000
+  bet_temperature: 0.25
 
 eps_greedy:                       # used only for A/B comparison (Milestone 5)
   eps_start: 1.0

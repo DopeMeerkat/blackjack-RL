@@ -23,6 +23,7 @@ import argparse
 import signal
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +76,20 @@ def _train_config(cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Oracle helpers
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _oracle_act(oracle: DQNAgent, obs: np.ndarray, masks: np.ndarray) -> np.ndarray:
+    """Greedy oracle action selection — skips reset_noise (oracle is deterministic)."""
+    obs_t  = torch.tensor(obs,   dtype=torch.float32, device=oracle.device)
+    mask_t = torch.tensor(masks, dtype=torch.bool,    device=oracle.device)
+    play_q = oracle.online_net(obs_t).clone()
+    play_q[~mask_t] = -1e9
+    return play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
 # Oracle loader
 # ---------------------------------------------------------------------------
 
@@ -112,6 +127,8 @@ def train(args: argparse.Namespace) -> None:
     exp_name  = args.exp_name
     total_hands = args.total_hands or cfg.get("total_hands", 10_000_000)
     num_envs  = cfg.get("num_envs", 64)
+    bet_multipliers_list = [float(m) for m in cfg.get("bet_multipliers", [1, 2, 4, 8, 12])]
+    n_bet_actions = len(bet_multipliers_list)
 
     print(f"Device:       {device}")
     print(f"Experiment:   {exp_name}")
@@ -155,18 +172,23 @@ def train(args: argparse.Namespace) -> None:
     bet_obs_dim = int(cfg.get("bet_obs_dim", BET_OBS_DIM))
     pending_bet_obs    = np.zeros((num_envs, bet_obs_dim), dtype=np.float32)
     pending_bet_action = np.zeros(num_envs, dtype=np.int32)
+    pending_bet_mult   = np.zeros(num_envs, dtype=np.float32)
     has_pending_bet    = np.zeros(num_envs, dtype=bool)
 
-    eval_every = cfg.get("eval_every_n_hands", 1_000_000)
-    ckpt_every = cfg.get("eval_every_n_hands", 1_000_000)
-    last_eval  = hands_played
-    last_ckpt  = hands_played
-    t_start    = time.time()
+    eval_every  = cfg.get("eval_every_n_hands", 1_000_000)
+    ckpt_every  = cfg.get("eval_every_n_hands", 1_000_000)
+    train_every = int(cfg.get("train_every_n_steps", 4))
+    last_eval   = hands_played
+    last_ckpt   = hands_played
+    t_start     = time.time()
+    global_step = 0
 
-    # Rolling stats windows
-    recent_rewards: list[float] = []
-    recent_losses:  list[float] = []
-    _WINDOW = 100_000
+    # Rolling stats — deque auto-drops oldest element, O(1) append/pop.
+    recent_rewards     = deque(maxlen=100_000)
+    recent_multipliers = deque(maxlen=100_000)
+    recent_bet_actions = deque(maxlen=100_000)
+    recent_losses      = deque(maxlen=10_000)
+    _pending_train = 0   # accumulated hands; flush one train_step per train_every
 
     _interrupted = [False]
 
@@ -199,16 +221,18 @@ def train(args: argparse.Namespace) -> None:
             ])
             bet_acts = bet_agent.select_actions_batch(bet_obs_batch, greedy=False)
             for j, i in enumerate(bet_envs):
+                act = int(bet_acts[j])
                 pending_bet_obs[i]    = bet_obs_batch[j]
-                pending_bet_action[i] = int(bet_acts[j])
+                pending_bet_action[i] = act
+                pending_bet_mult[i]   = bet_multipliers_list[act]
                 has_pending_bet[i]    = True
-                actions[i]            = int(bet_acts[j])
+                actions[i]            = act
 
-        # --- Play phase: oracle selects deterministically ---
+        # --- Play phase: oracle selects deterministically (no reset_noise) ---
         play_envs = np.where(~in_bet)[0]
         if len(play_envs) > 0:
-            actions[play_envs] = play_agent.select_play_actions_batch(
-                obs_arr[play_envs], masks_arr[play_envs]
+            actions[play_envs] = _oracle_act(
+                play_agent, obs_arr[play_envs], masks_arr[play_envs]
             )
 
         # --- Step ---
@@ -220,47 +244,92 @@ def train(args: argparse.Namespace) -> None:
                 hands_played += 1
                 hand_rew = float(rewards[i])
                 recent_rewards.append(hand_rew)
-                if len(recent_rewards) > _WINDOW:
-                    recent_rewards.pop(0)
 
                 if has_pending_bet[i]:
-                    bet_agent.add_transition(
-                        pending_bet_obs[i],
-                        int(pending_bet_action[i]),
-                        hand_rew,
-                    )
+                    mult = float(pending_bet_mult[i])
+                    act  = int(pending_bet_action[i])
+                    recent_multipliers.append(mult)
+                    recent_bet_actions.append(act)
+                    # Normalise by the bet multiplier so Q-values estimate the
+                    # per-unit outcome (≈ ±1 std) rather than the scaled reward
+                    # (std up to ≈13 for 12× bets). Action selection re-applies
+                    # the multiplier via BetAgent._weighted().
+                    norm_rew = hand_rew / max(mult, 1e-8)
+                    bet_agent.add_transition(pending_bet_obs[i], act, norm_rew)
                     has_pending_bet[i] = False
-                    loss = bet_agent.train_step()
-                    if loss is not None:
-                        recent_losses.append(loss)
-                        if len(recent_losses) > _WINDOW:
-                            recent_losses.pop(0)
+                    _pending_train += 1
 
                 reset_obs, reset_mask, reset_info = vec_env.reset_at(i)
                 next_obs[i]   = reset_obs
                 next_masks[i] = reset_mask
                 infos[i]      = reset_info
 
+        # --- Gradient updates: one step per train_every completed hands ---
+        while _pending_train >= train_every:
+            loss = bet_agent.train_step()
+            _pending_train -= train_every
+            if loss is not None:
+                recent_losses.append(loss)
+
         obs_arr   = next_obs
         masks_arr = next_masks
+        global_step += 1
 
-        # --- Periodic logging ---
+        # --- Per-step TB logging (mirrors train_curriculum every 1 000 steps) ---
+        if writer and global_step % 1_000 == 0:
+            if recent_losses:
+                writer.add_scalar("train/bet_loss",
+                                  float(np.mean(recent_losses)), hands_played)
+            writer.add_scalar("train/replay_size",
+                              len(bet_agent.replay), hands_played)
+            if recent_multipliers:
+                writer.add_scalar("train/avg_multiplier",
+                                  float(np.mean(recent_multipliers)),
+                                  hands_played)
+
+        # --- Periodic eval ---
         if hands_played - last_eval >= eval_every and hands_played > last_eval:
-            elapsed  = time.time() - t_start
-            rate     = hands_played / elapsed
-            mean_ev  = float(np.mean(recent_rewards)) if recent_rewards else float("nan")
-            mean_loss = float(np.mean(recent_losses[-10_000:])) if recent_losses else float("nan")
+            elapsed   = time.time() - t_start
+            rate      = hands_played / elapsed
+
+            # EV per unit wagered: rewards are already scaled by bet_multiplier,
+            # so we divide by the average multiplier to recover per-unit return.
+            mean_ev_hand = float(np.mean(recent_rewards)) if recent_rewards else float("nan")
+            mean_mult    = float(np.mean(recent_multipliers)) if recent_multipliers else 1.0
+            ev_per_unit  = mean_ev_hand / max(mean_mult, 1e-8)
+            mean_loss    = float(np.mean(recent_losses)) if recent_losses else float("nan")
+
+            # Bet-action distribution over the recent window
+            act_counts = np.bincount(
+                np.array(recent_bet_actions, dtype=np.int32), minlength=n_bet_actions
+            ) if recent_bet_actions else np.zeros(n_bet_actions, dtype=np.int64)
+            act_pcts   = act_counts / max(act_counts.sum(), 1)
+            bet_str = "  ".join(
+                f"{bet_multipliers_list[a]:.0f}x={act_pcts[a]*100:.1f}%"
+                for a in range(n_bet_actions)
+            )
+
             print(
                 f"  hands={hands_played:>10,}  "
-                f"bet_EV={mean_ev*100:+.3f}%  "
-                f"bet_loss={mean_loss:.5f}  "
+                f"EV/unit={ev_per_unit*100:+.3f}%  "
+                f"EV/hand={mean_ev_hand*100:+.3f}%  "
+                f"avg_mult={mean_mult:.2f}x  "
+                f"loss={mean_loss:.5f}  "
                 f"buf={len(bet_agent.replay):,}  "
-                f"rate={rate/1000:.1f}k/s"
+                f"rate={rate/1000:.1f}k/s\n"
+                f"    bets: {bet_str}"
             )
+
             if writer:
-                writer.add_scalar("train/bet_ev",       mean_ev,   hands_played)
-                writer.add_scalar("train/bet_loss",     mean_loss, hands_played)
-                writer.add_scalar("train/replay_size",  len(bet_agent.replay), hands_played)
+                writer.add_scalar("eval/ev_per_unit",   ev_per_unit,   hands_played)
+                writer.add_scalar("eval/ev_per_hand",   mean_ev_hand,  hands_played)
+                writer.add_scalar("eval/avg_multiplier", mean_mult,    hands_played)
+                writer.add_scalar("eval/bet_loss",       mean_loss,    hands_played)
+                for a in range(n_bet_actions):
+                    writer.add_scalar(
+                        f"eval/bet_action_pct_{a}", float(act_pcts[a]), hands_played
+                    )
+
             last_eval = hands_played
 
         # --- Periodic checkpoint ---

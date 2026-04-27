@@ -103,6 +103,13 @@ class BetAgent:
         capacity         = int(config.get("bet_replay_cap",   _CAPACITY))
         self.temperature = float(config.get("bet_temperature",_TEMPERATURE))
 
+        # Multiplier weights applied to Q-values before softmax/argmax so that
+        # the policy correctly reflects E[profit] = Q(obs, k) * multiplier[k].
+        # Q-values estimate per-unit EV; multiplying by the actual stake gives
+        # the expected absolute profit for each bet size.
+        mults = config.get("bet_multipliers", [1, 2, 4, 8, 12])
+        self.multipliers = torch.tensor(mults, dtype=torch.float32, device=device)
+
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
@@ -119,19 +126,28 @@ class BetAgent:
     # Action selection
     # ------------------------------------------------------------------
 
+    def _weighted(self, q: torch.Tensor) -> torch.Tensor:
+        """Scale raw Q-values by bet multipliers: q_weighted[k] = Q[k] * mult[k].
+
+        The network outputs per-unit EV estimates.  Multiplying by the stake
+        converts these to expected absolute profit, which is the correct signal
+        for both softmax exploration and greedy selection.
+        """
+        return q * self.multipliers
+
     @torch.no_grad()
     def select_action(self, obs: np.ndarray) -> int:
         """Sample a bet action using softmax-temperature exploration."""
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        q = self.net(obs_t).squeeze(0)
-        probs = F.softmax(q / self.temperature, dim=0).cpu().numpy()
+        q_w = self._weighted(self.net(obs_t).squeeze(0))
+        probs = F.softmax(q_w / self.temperature, dim=0).cpu().numpy()
         return int(np.random.choice(len(probs), p=probs))
 
     @torch.no_grad()
     def select_action_greedy(self, obs: np.ndarray) -> int:
         """Argmax bet action (deterministic evaluation)."""
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        return int(self.net(obs_t).argmax(dim=1).item())
+        return int(self._weighted(self.net(obs_t).squeeze(0)).argmax().item())
 
     @torch.no_grad()
     def select_actions_batch(
@@ -147,15 +163,11 @@ class BetAgent:
             (K,) int32 action array.
         """
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        q = self.net(obs_t)
+        q_w = self._weighted(self.net(obs_t))
         if greedy:
-            return q.argmax(dim=1).cpu().numpy().astype(np.int32)
-        probs = F.softmax(q / self.temperature, dim=1).cpu().numpy()
-        k = probs.shape[0]
-        actions = np.empty(k, dtype=np.int32)
-        for i in range(k):
-            actions[i] = np.random.choice(probs.shape[1], p=probs[i])
-        return actions
+            return q_w.argmax(dim=1).cpu().numpy().astype(np.int32)
+        probs = F.softmax(q_w / self.temperature, dim=1)
+        return torch.multinomial(probs, num_samples=1).squeeze(1).cpu().numpy().astype(np.int32)
 
     # ------------------------------------------------------------------
     # Replay insertion

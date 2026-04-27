@@ -53,6 +53,12 @@ _RANK_TO_BUCKET = {
     2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8,
     10: 9, 11: 9, 12: 9, 13: 9,
 }
+# Pre-built lookup table for vectorised get_rank_counts().
+# _shoe dtype is int8 with rank values in [1, 13]; index 0 is unused padding.
+_BUCKET_LUT = np.zeros(14, dtype=np.int8)
+for _r, _b in _RANK_TO_BUCKET.items():
+    _BUCKET_LUT[_r] = _b
+del _r, _b
 
 
 def _card_value(rank: int) -> int:
@@ -205,10 +211,8 @@ class BlackjackEnv:
         Buckets: [A, 2, 3, 4, 5, 6, 7, 8, 9, 10-group].  The bet agent
         normalises these against the initial bucket counts in a full shoe.
         """
-        counts = np.zeros(10, dtype=np.int32)
-        for rank in self._shoe[self._shoe_pos:]:
-            counts[_RANK_TO_BUCKET[int(rank)]] += 1
-        return counts
+        remaining = self._shoe[self._shoe_pos:]
+        return np.bincount(_BUCKET_LUT[remaining], minlength=10).astype(np.int32)
 
     def seed(self, seed: int) -> None:
         self._rng = np.random.default_rng(seed)

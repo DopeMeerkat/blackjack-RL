@@ -44,7 +44,7 @@ ACTION_NAMES = {HIT: "H", STAND: "S", DOUBLE: "D", SPLIT: "P"}
 
 
 # ---------------------------------------------------------------------------
-# Basic strategy oracle (S17, DAS — same table as compare_basic_strategy.py)
+# Basic strategy oracle (S17 — same table as compare_basic_strategy.py)
 # ---------------------------------------------------------------------------
 
 def basic_strategy_action(
@@ -55,7 +55,7 @@ def basic_strategy_action(
     can_split: bool,
     pair_value: int | None,
 ) -> int:
-    """Return the standard basic-strategy action for S17+DAS (no surrender)."""
+    """Return the standard basic-strategy action for S17 (no surrender)."""
     d = dealer_upcard_value
 
     if can_split and pair_value is not None:
@@ -65,23 +65,17 @@ def basic_strategy_action(
         if pv == 9:   return SPLIT if d not in (7, 10, 1) else STAND
         if pv == 8:   return SPLIT
         if pv == 7:   return SPLIT if d <= 7 else HIT
-        if pv == 6:   return SPLIT if 2 <= d <= 6 else HIT
-        if pv == 4:   return SPLIT if d in (5, 6) else HIT
-        if pv == 3:   return SPLIT if 2 <= d <= 7 else HIT
-        if pv == 2:   return SPLIT if 2 <= d <= 7 else HIT
+        if pv == 6:   return SPLIT if 3 <= d <= 6 else HIT
+        if pv == 3:   return SPLIT if 4 <= d <= 7 else HIT
+        if pv == 2:   return SPLIT if 4 <= d <= 7 else HIT
         
 
     if usable_ace:
         s = player_sum
-        if s == 20:  return STAND
-        if s == 19:
-            if d == 6:
-                return DOUBLE if can_double else STAND
-            else:
-                return STAND
+        if s >= 19:  return STAND
         if s == 18:
-            if d in (7, 8):  return STAND
-            if 2 <= d <= 6:     return DOUBLE if can_double else STAND
+            if d in (2, 7, 8):  return STAND
+            if 3 <= d <= 6:     return DOUBLE if can_double else STAND
             return HIT
         if s == 17:  return DOUBLE if (3 <= d <= 6 and can_double) else HIT
         if s in (15, 16): return DOUBLE if (4 <= d <= 6 and can_double) else HIT
@@ -92,7 +86,7 @@ def basic_strategy_action(
     if h >= 17:  return STAND
     if h >= 13:  return STAND if 2 <= d <= 6 else HIT
     if h == 12:  return STAND if 4 <= d <= 6 else HIT
-    if h == 11:  return DOUBLE if can_double else HIT
+    if h == 11:  return DOUBLE if (can_double and d != 1) else HIT
     if h == 10:  return DOUBLE if (can_double and d not in (10, 1)) else HIT
     if h == 9:   return DOUBLE if (can_double and 3 <= d <= 6) else HIT
     return HIT

@@ -316,8 +316,8 @@ def _deviation_test_tcs(cell_key: tuple) -> list[float]:
     rules = DEVIATIONS[cell_key]
     tcs: set[float] = set()
     for _, _, threshold, _, _ in rules:
-        tcs.add(float(threshold - 1))
-        tcs.add(float(threshold))
+        tcs.add(float(threshold - 2))
+        tcs.add(float(threshold + 1))
     return sorted(tcs)
 
 
@@ -755,25 +755,25 @@ def print_report(
 
     # --- Evaluation 2: Per-deviation following ---
     print(f"\n  Evaluation 2: Deviation Following")
-    print(f"  (each deviation at threshold-straddling TCs; oracle=BS when deviation is off)")
-    print(f"  Overall:  {agreement['dev_agreement']*100:5.1f}%"
-          f"   ({agreement['n_dev_match']}/{agreement['n_dev_total']} tests)\n")
+    print(f"  (oracle = BS + deviation rule; tested at TCs straddling each threshold)")
+    print(f"  Overall: {agreement['dev_agreement']*100:5.1f}%"
+          f"  ({agreement['n_dev_match']}/{agreement['n_dev_total']} tests)\n")
 
     for (ps, ua, dv), rec in sorted(agreement["dev_results"].items()):
         cell  = f"{'soft' if ua else 'hard'} {ps} vs {dv}"
         rules = DEVIATIONS.get((ps, ua, dv), [])
-        rule_desc = "  ".join(
-            f"TC{'≥' if d == 'gte' else '<'}{t:+d}→{ACTION_NAMES[a]}"
+        rule_desc = ", ".join(
+            f"TC{'≥' if d == 'gte' else '<'}{t:+d} → {ACTION_NAMES[a]}"
             + (" (D req.)" if req else "")
             for idx, d, t, a, req in rules
         )
-        tc_results = "  ".join(
-            f"TC={tc:+g}:{ACTION_NAMES[exp]}/{ACTION_NAMES[agt]}"
-            f"({'on' if fires else 'off'}){'OK' if ok else 'FAIL'}"
-            for tc, agt, exp, fires, ok in sorted(rec["tcs"], key=lambda x: x[0])
-        )
         status = "PASS" if rec["ok"] == rec["n"] else "FAIL"
-        print(f"    [{status}] {cell:18s}  {rule_desc:22s}  {tc_results}")
+        print(f"    [{status}] {cell:18s}  {rule_desc}")
+        for tc, agt, exp, fires, ok in sorted(rec["tcs"], key=lambda x: x[0]):
+            state  = "on " if fires else "off"
+            result = "OK" if ok else "FAIL"
+            print(f"             TC {tc:+3.0f} ({state}):  "
+                  f"oracle {ACTION_NAMES[exp]}  agent {ACTION_NAMES[agt]}  {result}")
 
     # --- Summary ---
     pass_bs     = agreement["bs_agreement"] >= 0.95

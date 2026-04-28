@@ -36,8 +36,120 @@ import torch
 
 from agent.bet_agent import BetAgent
 from agent.dqn import DQNAgent
+from agent.network import BlackjackNet
 from env.bet_encoding import BET_OBS_DIM, encode_bet_obs
 from env.vec_env import VecBlackjackEnv
+
+
+# ---------------------------------------------------------------------------
+# Action constants
+# ---------------------------------------------------------------------------
+
+HIT    = 0
+STAND  = 1
+DOUBLE = 2
+SPLIT  = 3
+
+
+# ---------------------------------------------------------------------------
+# Basic strategy (S17, no surrender) + decode helpers
+# ---------------------------------------------------------------------------
+
+_UPCARD_IDX_TO_VAL = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+
+def basic_strategy_action(
+    player_sum: int,
+    usable_ace: bool,
+    dealer_upcard_value: int,
+    can_double: bool,
+    can_split: bool,
+    pair_value: int | None,
+) -> int:
+    """Return the standard basic-strategy action for S17 (no surrender)."""
+    d = dealer_upcard_value
+
+    if can_split and pair_value is not None:
+        pv = pair_value
+        if pv == 1:   return SPLIT
+        if pv == 10:  return STAND
+        if pv == 9:   return SPLIT if d not in (7, 10, 1) else STAND
+        if pv == 8:   return SPLIT
+        if pv == 7:   return SPLIT if d <= 7 else HIT
+        if pv == 6:   return SPLIT if 3 <= d <= 6 else HIT
+        if pv == 3:   return SPLIT if 4 <= d <= 7 else HIT
+        if pv == 2:   return SPLIT if 4 <= d <= 7 else HIT
+        
+
+    if usable_ace:
+        s = player_sum
+        if s >= 19:  return STAND
+        if s == 18:
+            if d in (2, 7, 8):  return STAND
+            if 3 <= d <= 6:     return DOUBLE if can_double else STAND
+            return HIT
+        if s == 17:  return DOUBLE if (3 <= d <= 6 and can_double) else HIT
+        if s in (15, 16): return DOUBLE if (4 <= d <= 6 and can_double) else HIT
+        if s in (13, 14): return DOUBLE if (5 <= d <= 6 and can_double) else HIT
+        return HIT
+
+    h = player_sum
+    if h >= 17:  return STAND
+    if h >= 13:  return STAND if 2 <= d <= 6 else HIT
+    if h == 12:  return STAND if 4 <= d <= 6 else HIT
+    if h == 11:  return DOUBLE if (can_double and d != 1) else HIT
+    if h == 10:  return DOUBLE if (can_double and d not in (10, 1)) else HIT
+    if h == 9:   return DOUBLE if (can_double and 3 <= d <= 6) else HIT
+    return HIT
+
+
+def _decode_obs(obs: np.ndarray, mask: np.ndarray):
+    player_sum = round(float(obs[0]) * 17.0 + 4.0)
+    usable_ace = bool(obs[1] > 0.5)
+    upcard_idx = int(np.argmax(obs[2:12]))
+    dealer_val = _UPCARD_IDX_TO_VAL[upcard_idx]
+    is_pair    = bool(obs[12] > 0.5)
+    pair_val   = None
+    if is_pair:
+        pair_idx = int(np.argmax(obs[13:23]))
+        pair_val = _UPCARD_IDX_TO_VAL[pair_idx]
+    can_double = bool(mask[2])
+    can_split  = bool(mask[3])
+    return player_sum, usable_ace, dealer_val, can_double, can_split, pair_val
+
+
+# ---------------------------------------------------------------------------
+# Policy factories
+# ---------------------------------------------------------------------------
+
+def make_bs_policy():
+    """Batched basic-strategy play policy."""
+    def policy_fn(obs_batch: np.ndarray, mask_batch: np.ndarray) -> np.ndarray:
+        k = len(obs_batch)
+        actions = np.empty(k, dtype=np.int32)
+        for i in range(k):
+            ps, ua, dv, cd, cs, pv = _decode_obs(obs_batch[i], mask_batch[i])
+            a = basic_strategy_action(
+                player_sum=ps, usable_ace=ua, dealer_upcard_value=dv,
+                can_double=cd, can_split=cs, pair_value=pv,
+            )
+            if not mask_batch[i][a]:
+                a = int(np.argmax(mask_batch[i].astype(np.float32)))
+            actions[i] = a
+        return actions
+    return policy_fn
+
+
+def make_agent_policy(net: BlackjackNet, device: torch.device):
+    """Batched DQN-oracle play policy."""
+    def policy_fn(obs_batch: np.ndarray, mask_batch: np.ndarray) -> np.ndarray:
+        obs_t  = torch.tensor(obs_batch,  dtype=torch.float32, device=device)
+        mask_t = torch.tensor(mask_batch, dtype=torch.bool,    device=device)
+        with torch.no_grad():
+            play_q = net(obs_t).clone()
+            play_q[~mask_t] = -1e9
+        return play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
+    return policy_fn
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +240,7 @@ def load_bet_agent(checkpoint_path: str, fallback_cfg: dict,
 # ---------------------------------------------------------------------------
 
 def run_eval(
-    play_agent: DQNAgent,
+    play_policy,                    # Callable[[obs_batch, mask_batch], actions]
     bet_agent: BetAgent | None,     # None → flat 1× baseline
     cfg: dict,
     n_hands: int,
@@ -195,9 +307,7 @@ def run_eval(
         # Play phase — oracle
         play_envs = np.where(~in_bet)[0]
         if len(play_envs) > 0:
-            actions[play_envs] = play_agent.select_play_actions_batch(
-                obs_arr[play_envs], masks_arr[play_envs]
-            )
+            actions[play_envs] = play_policy(obs_arr[play_envs], masks_arr[play_envs])
 
         next_obs, next_masks, env_rewards, dones, infos = vec_env.step(actions)
 
@@ -327,8 +437,13 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"Eval hands:    {args.eval_hands:,}")
     print(f"Num envs:      {args.num_envs}")
 
-    print(f"\nLoading play oracle: {args.play_oracle}")
-    play_agent = load_play_oracle(args.play_oracle, cfg, device)
+    if args.basic_strategy:
+        print("\nPlay oracle:   basic strategy (no checkpoint)")
+        play_policy = make_bs_policy()
+    else:
+        print(f"\nLoading play oracle: {args.play_oracle}")
+        play_agent = load_play_oracle(args.play_oracle, cfg, device)
+        play_policy = make_agent_policy(play_agent.online_net, device)
 
     print(f"Loading bet agent:   {args.bet_agent}")
     bet_agent = load_bet_agent(args.bet_agent, cfg, device)
@@ -338,12 +453,12 @@ def evaluate(args: argparse.Namespace) -> None:
 
     print(f"\nRunning bet-agent evaluation  ({args.eval_hands:,} hands)…")
     agent_stats = run_eval(
-        play_agent, bet_agent, cfg, args.eval_hands, args.num_envs, device, seed
+        play_policy, bet_agent, cfg, args.eval_hands, args.num_envs, device, seed
     )
 
     print(f"Running flat-1× baseline      ({args.eval_hands:,} hands)…")
     flat_stats = run_eval(
-        play_agent, None, cfg, args.eval_hands, args.num_envs, device, seed
+        play_policy, None, cfg, args.eval_hands, args.num_envs, device, seed
     )
 
     print_bet_distribution(agent_stats, bet_multipliers_list,
@@ -355,8 +470,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Evaluate bet agent: TC correlation, distribution, EV vs flat 1×"
     )
-    p.add_argument("--play-oracle", required=True,
-                   help="Path to frozen play-oracle checkpoint (.pt).")
+    play_group = p.add_mutually_exclusive_group(required=True)
+    play_group.add_argument("--play-oracle",
+                            help="Path to frozen play-oracle checkpoint (.pt).")
+    play_group.add_argument("--basic-strategy", action="store_true",
+                            help="Use basic strategy (no checkpoint) as the play oracle.")
     p.add_argument("--bet-agent",   required=True,
                    help="Path to trained bet-agent checkpoint (.pt).")
     p.add_argument("--config",      default="configs/default.yaml")

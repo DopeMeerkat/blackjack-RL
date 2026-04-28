@@ -282,7 +282,7 @@ if __name__ == "__main__":
     evaluate_agent(trained_q_table, num_games=3)
     
     # 3. Calculate statistically significant win/loss metrics
-    evaluate_win_rate(trained_q_table, num_games=10_000)
+    evaluate_win_rate(trained_q_table, num_games=50_000)
 
     # 4. Print the learned Q-values for inspection
     print_strategy_chart(trained_q_table)

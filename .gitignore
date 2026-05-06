@@ -6,3 +6,4 @@ DQN/activate.bat
 __pycache__/
 *.pyc
 *.pyo
+DQN/project_report_design_doc.md

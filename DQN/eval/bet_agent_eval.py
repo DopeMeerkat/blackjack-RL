@@ -79,7 +79,7 @@ def basic_strategy_action(
         if pv == 6:   return SPLIT if 3 <= d <= 6 else HIT
         if pv == 3:   return SPLIT if 4 <= d <= 7 else HIT
         if pv == 2:   return SPLIT if 4 <= d <= 7 else HIT
-        
+
 
     if usable_ace:
         s = player_sum
@@ -413,7 +413,7 @@ def print_ev_comparison(
     print(f"{'─'*60}")
     print(f"  Flat 1× baseline:          {ev_flat*100:+.4f}%  "
           f"(±{ci_flat*100:.4f}%, n={len(rew_flat):,})")
-    print(f"  Bet agent raw EV:          {ev_agent_raw*100:+.4f}%  "
+    print(f"  Bet agent mean reward:  {ev_agent_raw*100:+.4f}%  "
           f"(±{ci_agent*100:.4f}%, n={len(rew_agent):,})")
     print(f"  Bet agent avg multiplier:  {avg_mult:.3f}×")
     print(f"  Bet agent EV per unit:     {ev_agent_per_unit*100:+.4f}%")

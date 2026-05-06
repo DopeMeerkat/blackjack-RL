@@ -1,45 +1,39 @@
-"""Double DQN training step.
+"""Rainbow DQN training step (distributional C51 + Double DQN + n-step + PER)
+for the play agent only.
 
-Implements the core learning algorithm described in blackjack_rl_design.md §7
-and §15.3:
+Implements the core learning algorithm:
 
-  Double DQN Bellman target (for playing-head transitions):
-    a* = argmax_a [Q_online(s', a) + illegal_mask(s', a)]
-    y  = r + γ * Q_target(s', a*)             (terminal: y = r)
+  Atoms z_k ∈ [V_min, V_max] evenly spaced.  The network outputs, for each
+  (state, action), a probability distribution p(s, a, ·) over the atoms.
+  Expected Q-value for action selection is E[Z] = Σ_k z_k · p(s, a, k).
 
-  Bet-head transitions are one-step bandits (§15.4):
-    y  = r    (done=True always; no next-state bootstrap)
+  Double DQN + distributional Bellman target (n-step):
+    a* = argmax_a E_z[p_online(s_{t+n}, a, ·)]   — masked to legal actions
+    T z_k = clip(R_n + γ^n · (1 − done) · z_k, V_min, V_max)
+    p_target = p_target_net(s_{t+n}, a*, ·)
+    m = Π p_target onto {z_k}                    — categorical projection
+    loss = −Σ_k m[k] · log p_online(s_t, a_t, k)  — cross-entropy (≡ KL + H)
 
-Both heads share the trunk; gradients from both flow into the trunk.
 The target network is updated via Polyak averaging after every training step.
-
-Action masking in the Bellman target:
-  illegal_mask(s, a) = 0 if a is legal, else −1e9.
-  Applied additively to Q-values before argmax/value-read.
-  This prevents the bootstrap from selecting or evaluating illegal actions
-  even when the target network is stale.
+The bet decision is made by a separate, simpler agent (see agent/bet_agent.py).
 """
 
 from __future__ import annotations
 
-import copy
-
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
 from agent.network import BlackjackNet
-from agent.replay import PrioritizedReplayBuffer
+from agent.replay import NStepAccumulator, PrioritizedReplayBuffer
 
 
 class DQNAgent:
     """Wraps online + target networks and exposes a single training step.
 
     Args:
-        net_config:      dict with network hyperparameters (merged state +
-                         network sections of default.yaml).
+        net_config:      dict with network hyperparameters.
         train_config:    dict with training hyperparameters.
         replay_capacity: Replay buffer size.
         device:          torch.device.
@@ -57,13 +51,20 @@ class DQNAgent:
         self.tau          = train_config["target_tau"]
         self.batch_size   = train_config["batch_size"]
         self.grad_clip    = train_config.get("grad_clip", 10.0)
-        self.obs_dim      = net_config.get("obs_dim", 28)
+        self.obs_dim      = net_config.get("obs_dim", 27)
+        self.n_step       = int(train_config.get("n_step", 1))
+        self._gamma_n     = self.gamma ** self.n_step
 
-        # Online and target networks
         self.online_net = BlackjackNet(net_config).to(device)
         self.target_net = BlackjackNet(net_config).to(device)
         self.target_net.load_state_dict(self.online_net.state_dict())
-        self.target_net.set_deterministic(True)  # target always deterministic
+        self.target_net.set_deterministic(True)
+
+        self.n_atoms  = self.online_net.n_atoms
+        self.v_min    = self.online_net.v_min
+        self.v_max    = self.online_net.v_max
+        self.delta_z  = self.online_net.delta_z
+        self.support  = self.online_net.support
 
         self.optimizer = optim.Adam(
             self.online_net.parameters(),
@@ -77,22 +78,59 @@ class DQNAgent:
             alpha=alpha,
         )
 
+        self._nstep_accumulators: dict[int, NStepAccumulator] = {}
         self._train_steps = 0
 
     # ------------------------------------------------------------------
-    # Action selection (during environment rollout)
+    # Replay insertion
+    # ------------------------------------------------------------------
+
+    def _accumulator(self, env_id: int) -> NStepAccumulator:
+        acc = self._nstep_accumulators.get(env_id)
+        if acc is None:
+            acc = NStepAccumulator(self.n_step, self.gamma)
+            self._nstep_accumulators[env_id] = acc
+        return acc
+
+    def add_play_transition(
+        self,
+        env_id: int,
+        obs: np.ndarray,
+        action: int,
+        reward: float,
+        next_obs: np.ndarray,
+        done: bool,
+        mask: np.ndarray,
+        next_mask: np.ndarray,
+    ) -> None:
+        """Push a single-step playing transition through the n-step accumulator."""
+        acc = self._accumulator(env_id)
+        flushed = acc.push(dict(
+            obs=obs, action=action, reward=reward, next_obs=next_obs,
+            done=done, mask=mask, next_mask=next_mask,
+        ))
+        for t in flushed:
+            self.replay.add(
+                obs=t["obs"],
+                action=t["action"],
+                reward=t["reward"],
+                next_obs=t["next_obs"],
+                done=t["done"],
+                mask=t["mask"],
+                next_mask=t["next_mask"],
+            )
+
+    # ------------------------------------------------------------------
+    # Action selection
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def select_play_actions_batch(
         self,
-        obs: np.ndarray,     # (K, 28)
-        masks: np.ndarray,   # (K, 4) bool
+        obs: np.ndarray,
+        masks: np.ndarray,
     ) -> np.ndarray:
-        """Select playing actions for a batch of envs.
-
-        Resamples noise before inference.  Mask is applied additively
-        (illegal actions set to −1e9).
+        """Select playing actions for a batch of envs via expected Q.
 
         Returns: (K,) int32 action array.
         """
@@ -100,158 +138,116 @@ class DQNAgent:
         mask_t = torch.tensor(masks, dtype=torch.bool,    device=self.device)
 
         self.online_net.reset_noise()
-        play_q, _ = self.online_net(obs_t)
-        play_q = play_q.clone()
+        play_q = self.online_net(obs_t).clone()
         play_q[~mask_t] = -1e9
         return play_q.argmax(dim=1).cpu().numpy().astype(np.int32)
 
-    @torch.no_grad()
-    def select_bet_actions_batch(self, obs: np.ndarray) -> np.ndarray:
-        """Select bet actions for a batch of envs.
+    # ------------------------------------------------------------------
+    # Categorical projection (C51)
+    # ------------------------------------------------------------------
 
-        Returns: (K,) int32 bet-index array.
-        """
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        self.online_net.reset_noise()
-        _, bet_q = self.online_net(obs_t)
-        return bet_q.argmax(dim=1).cpu().numpy().astype(np.int32)
+    def _project(
+        self,
+        rewards: torch.Tensor,
+        dones:   torch.Tensor,
+        target_dist: torch.Tensor,
+        bootstrap_factor: float,
+    ) -> torch.Tensor:
+        """Project a bootstrapped target distribution onto the atom support."""
+        B       = rewards.shape[0]
+        n_atoms = self.n_atoms
+        device  = rewards.device
+
+        not_done = (~dones).float().unsqueeze(1)
+        Tz = rewards.unsqueeze(1) + bootstrap_factor * not_done * self.support.unsqueeze(0)
+        Tz = Tz.clamp(self.v_min, self.v_max)
+
+        b = (Tz - self.v_min) / self.delta_z
+        l = b.floor().long().clamp_(0, n_atoms - 1)
+        u = b.ceil().long().clamp_(0, n_atoms - 1)
+
+        l_coef = (u.float() - b)
+        u_coef = (b - l.float())
+        eq = (l == u)
+        l_coef = torch.where(eq, torch.ones_like(l_coef), l_coef)
+
+        m = torch.zeros(B, n_atoms, device=device)
+        offset = (torch.arange(B, device=device) * n_atoms).unsqueeze(1)
+        m_flat = m.view(-1)
+        m_flat.index_add_(0, (l + offset).view(-1), (target_dist * l_coef).view(-1))
+        m_flat.index_add_(0, (u + offset).view(-1), (target_dist * u_coef).view(-1))
+        return m
 
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
 
     def train_step(self, beta: float) -> float | None:
-        """One gradient update.
-
-        Args:
-            beta: IS correction exponent for PER (annealed from 0.4 → 1.0).
-
-        Returns:
-            Loss value (float), or None if the buffer is too small.
-        """
+        """One gradient update.  Returns loss (float), or None if buffer too small."""
         if len(self.replay) < self.batch_size:
             return None
 
         batch, weights, leaf_indices = self.replay.sample(self.batch_size, beta)
 
-        obs       = torch.tensor(batch["obs"],      dtype=torch.float32, device=self.device)
-        actions   = torch.tensor(batch["actions"],  dtype=torch.long,    device=self.device)
-        rewards   = torch.tensor(batch["rewards"],  dtype=torch.float32, device=self.device)
-        next_obs  = torch.tensor(batch["next_obs"], dtype=torch.float32, device=self.device)
-        dones     = torch.tensor(batch["dones"],    dtype=torch.bool,    device=self.device)
-        next_masks= torch.tensor(batch["next_masks"],dtype=torch.bool,   device=self.device)
-        head_ids  = batch["head_ids"]    # numpy (B,) — stays on CPU for indexing
-        weights_t = torch.tensor(weights,dtype=torch.float32,device=self.device)
+        obs       = torch.tensor(batch["obs"],       dtype=torch.float32, device=self.device)
+        actions   = torch.tensor(batch["actions"],   dtype=torch.long,    device=self.device)
+        rewards   = torch.tensor(batch["rewards"],   dtype=torch.float32, device=self.device)
+        next_obs  = torch.tensor(batch["next_obs"],  dtype=torch.float32, device=self.device)
+        dones     = torch.tensor(batch["dones"],     dtype=torch.bool,    device=self.device)
+        next_masks= torch.tensor(batch["next_masks"],dtype=torch.bool,    device=self.device)
+        weights_t = torch.tensor(weights,            dtype=torch.float32, device=self.device)
 
-        play_mask = (head_ids == 0)
-        bet_mask  = (head_ids == 1)
+        B       = obs.shape[0]
+        n_atoms = self.n_atoms
 
-        td_errors   = np.zeros(len(head_ids), dtype=np.float32)
-        total_loss  = torch.zeros(1, device=self.device)
+        # Current distribution p_online(s, a_t, ·) — noisy
+        self.online_net.reset_noise()
+        self.online_net.set_deterministic(False)
+        play_dist_cur = self.online_net.forward_dist(obs)              # (B, n_play, n_atoms)
+        gather_idx    = actions.view(B, 1, 1).expand(-1, 1, n_atoms)
+        p_online_sa   = play_dist_cur.gather(1, gather_idx).squeeze(1) # (B, n_atoms)
 
-        # ----------------------------------------------------------------
-        # Playing-head loss (Double DQN with action masking)
-        # ----------------------------------------------------------------
-        if play_mask.any():
-            p_idx = np.where(play_mask)[0]
-
-            p_obs       = obs[p_idx]
-            p_actions   = actions[p_idx]
-            p_rewards   = rewards[p_idx]
-            p_next_obs  = next_obs[p_idx]
-            p_dones     = dones[p_idx]
-            p_next_masks= next_masks[p_idx]
-            p_weights   = weights_t[p_idx]
-
-            # Current Q-values (online net, noisy)
-            self.online_net.reset_noise()
+        with torch.no_grad():
+            # Double DQN: action selection via online net (deterministic for stability)
+            self.online_net.set_deterministic(True)
+            play_q_next_online = self.online_net(next_obs).clone()
             self.online_net.set_deterministic(False)
-            play_q_cur, _ = self.online_net(p_obs)
-            q_current = play_q_cur.gather(1, p_actions.unsqueeze(1)).squeeze(1)
+            play_q_next_online[~next_masks] = -1e9
+            a_star = play_q_next_online.argmax(dim=1)                  # (B,)
 
-            with torch.no_grad():
-                # Double DQN: online net picks the action (deterministic)
-                self.online_net.set_deterministic(True)
-                play_q_next_online, _ = self.online_net(p_next_obs)
-                self.online_net.set_deterministic(False)
+            # Target distribution at a*
+            play_dist_next_target = self.target_net.forward_dist(next_obs)
+            gather_star = a_star.view(B, 1, 1).expand(-1, 1, n_atoms)
+            p_target_sa = play_dist_next_target.gather(1, gather_star).squeeze(1)
 
-                play_q_next_online = play_q_next_online.clone()
-                play_q_next_online[~p_next_masks] = -1e9
-                a_star = play_q_next_online.argmax(dim=1)
+            m = self._project(
+                rewards=rewards,
+                dones=dones,
+                target_dist=p_target_sa,
+                bootstrap_factor=self._gamma_n,
+            )
 
-                # Target net evaluates the chosen action (always deterministic)
-                play_q_next_target, _ = self.target_net(p_next_obs)
-                play_q_next_target = play_q_next_target.clone()
-                play_q_next_target[~p_next_masks] = -1e9
-                q_target_vals = play_q_next_target.gather(
-                    1, a_star.unsqueeze(1)
-                ).squeeze(1)
+        log_p = torch.log(p_online_sa.clamp_min(1e-8))
+        per_sample_loss = -(m * log_p).sum(dim=1)
+        loss = (weights_t * per_sample_loss).mean()
 
-                # Bootstrap only for non-terminal transitions
-                not_done_f = (~p_dones).float()
-                q_targets = p_rewards + self.gamma * q_target_vals * not_done_f
-
-            td_err_play = (q_targets - q_current).detach().cpu().numpy()
-
-            # Normalize TD errors used for PER priorities only.
-            # DOUBLE (action=2) yields 2× rewards, so |TD errors| are
-            # ~2× larger, giving doubled transitions ~2× higher sampling rate.
-            # Dividing by 2 equalizes priority without touching the loss.
-            priority_td_play = td_err_play.copy()
-            priority_td_play[p_actions.cpu().numpy() == 2] /= 2.0
-            td_errors[p_idx] = priority_td_play
-
-            play_loss = (
-                p_weights * F.mse_loss(q_current, q_targets, reduction="none")
-            ).mean()
-            total_loss = total_loss + play_loss
-
-        # ----------------------------------------------------------------
-        # Bet-head loss (one-step bandit, §15.4 — no bootstrap)
-        # ----------------------------------------------------------------
-        if bet_mask.any():
-            b_idx = np.where(bet_mask)[0]
-
-            b_obs     = obs[b_idx]
-            b_actions = actions[b_idx]
-            b_rewards = rewards[b_idx]
-            b_weights = weights_t[b_idx]
-
-            # Current bet Q-values
-            _, bet_q_cur = self.online_net(b_obs)
-            q_current_bet = bet_q_cur.gather(1, b_actions.unsqueeze(1)).squeeze(1)
-
-            td_err_bet = (b_rewards - q_current_bet).detach().cpu().numpy()
-            td_errors[b_idx] = td_err_bet
-
-            bet_loss = (
-                b_weights * F.mse_loss(q_current_bet, b_rewards, reduction="none")
-            ).mean()
-            total_loss = total_loss + bet_loss
-
-        # ----------------------------------------------------------------
-        # Optimiser step
-        # ----------------------------------------------------------------
         self.optimizer.zero_grad()
-        total_loss.backward()
+        loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), self.grad_clip)
         self.optimizer.step()
 
-        # Update replay priorities with new TD errors
+        td_errors = per_sample_loss.detach().cpu().numpy().astype(np.float32)
         self.replay.update_priorities(leaf_indices, td_errors)
 
-        # Polyak update of target network
         self._polyak_update()
-
         self._train_steps += 1
-        return float(total_loss.item())
+        return float(loss.item())
 
     # ------------------------------------------------------------------
     # Target network update
     # ------------------------------------------------------------------
 
     def _polyak_update(self) -> None:
-        """θ_target ← τ θ_online + (1−τ) θ_target."""
         tau = self.tau
         with torch.no_grad():
             for p_online, p_target in zip(

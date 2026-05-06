@@ -1,6 +1,6 @@
 """Prioritized Experience Replay with a SumTree.
 
-Implements the PER algorithm (Schaul et al., 2016) used by the DQN agent.
+Implements the PER algorithm (Schaul et al., 2016) used by the play agent.
 Priorities are stored in a SumTree for O(log N) add and sample operations.
 Importance-sampling weights correct for the non-uniform sampling distribution.
 
@@ -8,8 +8,8 @@ Hyperparameters (from configs/default.yaml):
   alpha = 0.6   — how much prioritization is used (0 = uniform)
   beta         — IS exponent, annealed from 0.4 → 1.0 over training
 
-Each stored transition carries a ``head_id`` field (0 = playing head,
-1 = bet-sizing head) so the training step knows which loss to compute.
+All transitions are play-agent transitions; the bet agent uses a separate,
+much simpler uniform-sampling buffer (see ``agent/bet_agent.py``).
 
 All transitions are stored in pre-allocated NumPy arrays for efficiency.
 A circular write pointer wraps around after ``capacity`` transitions.
@@ -120,7 +120,6 @@ class PrioritizedReplayBuffer:
         self.dones     = np.zeros(capacity,            dtype=bool)
         self.masks     = np.zeros((capacity, 4),       dtype=bool)
         self.next_masks= np.zeros((capacity, 4),       dtype=bool)
-        self.head_ids  = np.zeros(capacity,            dtype=np.int8)
 
         self._write        = 0           # next write position
         self._n_entries    = 0
@@ -139,7 +138,6 @@ class PrioritizedReplayBuffer:
         done: bool,
         mask: np.ndarray,
         next_mask: np.ndarray,
-        head_id: int,
     ) -> None:
         """Add one transition with maximum current priority."""
         i = self._write
@@ -150,7 +148,6 @@ class PrioritizedReplayBuffer:
         self.dones[i]      = done
         self.masks[i]      = mask
         self.next_masks[i] = next_mask
-        self.head_ids[i]   = head_id
 
         # New transitions get max priority so they're sampled at least once.
         priority = self._max_priority ** self.alpha
@@ -215,7 +212,6 @@ class PrioritizedReplayBuffer:
             "dones":      self.dones[leaf_indices],
             "masks":      self.masks[leaf_indices],
             "next_masks": self.next_masks[leaf_indices],
-            "head_ids":   self.head_ids[leaf_indices],
         }
         return batch, weights.astype(np.float32), leaf_indices
 
@@ -246,3 +242,81 @@ class PrioritizedReplayBuffer:
     def is_ready(self) -> bool:
         """True once the buffer has enough entries to sample a full batch."""
         return self._n_entries > 0
+
+
+# ---------------------------------------------------------------------------
+# N-step accumulator (Rainbow component)
+# ---------------------------------------------------------------------------
+
+class NStepAccumulator:
+    """Per-environment rolling buffer producing n-step transitions.
+
+    Each single-step transition is pushed via :meth:`push`.  Once ``n_step``
+    transitions have accumulated, an n-step transition is emitted whose
+    reward is the discounted sum and whose next-state is the tail's next_obs.
+    When a terminal transition arrives, **all** buffered transitions are
+    flushed (each with its remaining horizon truncated to the terminal step)
+    and the buffer is cleared.  This matches the standard Rainbow treatment:
+    intermediate states get shorter-horizon targets rather than leaking across
+    episode boundaries.
+
+    Because play-head done flags in this codebase fire only at hand
+    completion — never between split sub-hands — the n-step window can safely
+    span sub-hand boundaries; only true hand-end dones truncate the horizon.
+
+    The emitted transition records the actual horizon used (``n_step`` field),
+    so the DQN step can apply ``gamma ** n`` correctly even for truncated
+    tails.  In practice non-terminal flushes always use ``n_step == self.n``.
+    """
+
+    def __init__(self, n_step: int, gamma: float) -> None:
+        assert n_step >= 1, "n_step must be >= 1"
+        self.n = int(n_step)
+        self.gamma = float(gamma)
+        self._buf: list[dict] = []
+
+    def push(self, transition: dict) -> list[dict]:
+        """Append a single-step transition; return flushed n-step transitions.
+
+        ``transition`` must contain the keys expected by
+        :meth:`PrioritizedReplayBuffer.add` plus ``done``.
+        """
+        self._buf.append(transition)
+        flushed: list[dict] = []
+
+        if transition["done"]:
+            # Terminal: flush the whole buffer; each tail has done=True.
+            while self._buf:
+                flushed.append(self._make_nstep(length=len(self._buf)))
+                self._buf.pop(0)
+        elif len(self._buf) >= self.n:
+            flushed.append(self._make_nstep(length=self.n))
+            self._buf.pop(0)
+
+        return flushed
+
+    def _make_nstep(self, length: int) -> dict:
+        head = self._buf[0]
+        tail = self._buf[length - 1]
+        R = 0.0
+        g = 1.0
+        for k in range(length):
+            R += g * float(self._buf[k]["reward"])
+            g *= self.gamma
+        return dict(
+            obs=head["obs"],
+            action=int(head["action"]),
+            reward=float(R),
+            next_obs=tail["next_obs"],
+            done=bool(tail["done"]),
+            mask=head["mask"],
+            next_mask=tail["next_mask"],
+            n_step=int(length),
+        )
+
+    def reset(self) -> None:
+        """Discard any partial window without flushing (use on hard env reset)."""
+        self._buf.clear()
+
+    def __len__(self) -> int:
+        return len(self._buf)

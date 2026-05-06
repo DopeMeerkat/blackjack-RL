@@ -38,13 +38,27 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from env.count import HiLoCount
-from env.encoding import compute_mask, encode_state
+from env.encoding import OBS_DIM, compute_mask, encode_state
 
 # ---------------------------------------------------------------------------
 # Card helpers
 # ---------------------------------------------------------------------------
 
 _BET_MULTIPLIERS = [1, 2, 4, 8, 12]  # indexed 0-4
+
+# Rank-to-bucket mapping for get_rank_counts():
+#   bucket 0 = Ace, 1..8 = ranks 2..9, 9 = ten-group (10/J/Q/K).
+_RANK_TO_BUCKET = {
+    1: 0,
+    2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8,
+    10: 9, 11: 9, 12: 9, 13: 9,
+}
+# Pre-built lookup table for vectorised get_rank_counts().
+# _shoe dtype is int8 with rank values in [1, 13]; index 0 is unused padding.
+_BUCKET_LUT = np.zeros(14, dtype=np.int8)
+for _r, _b in _RANK_TO_BUCKET.items():
+    _BUCKET_LUT[_r] = _b
+del _r, _b
 
 
 def _card_value(rank: int) -> int:
@@ -190,6 +204,15 @@ class BlackjackEnv:
     @property
     def cards_in_shoe(self) -> int:
         return int(len(self._shoe) - self._shoe_pos)
+
+    def get_rank_counts(self) -> np.ndarray:
+        """Return remaining-card counts bucketed by rank (length 10).
+
+        Buckets: [A, 2, 3, 4, 5, 6, 7, 8, 9, 10-group].  The bet agent
+        normalises these against the initial bucket counts in a full shoe.
+        """
+        remaining = self._shoe[self._shoe_pos:]
+        return np.bincount(_BUCKET_LUT[remaining], minlength=10).astype(np.int32)
 
     def seed(self, seed: int) -> None:
         self._rng = np.random.default_rng(seed)
@@ -447,22 +470,17 @@ class BlackjackEnv:
     # ------------------------------------------------------------------
 
     def _bet_phase_obs(self) -> np.ndarray:
-        """28-dim observation with playing-state features zeroed."""
+        """27-dim placeholder observation during the bet phase.
+
+        The play agent never sees this — only its count/decks slots are
+        populated.  The bet agent uses ``get_rank_counts()`` instead.
+        """
+        obs = np.zeros(OBS_DIM, dtype=np.float32)
         tc = self._count.true_count(self.cards_in_shoe)
         dr = self._count.decks_remaining(self.cards_in_shoe)
-        return encode_state(
-            player_sum=0,
-            usable_ace=False,
-            dealer_upcard_rank=1,   # placeholder; zeroed by bet_phase=True
-            is_pair=False,
-            pair_rank=None,
-            can_double=False,
-            can_split=False,
-            true_count=tc,
-            decks_remaining=dr,
-            bet_multiplier=0.0,     # multiplier not yet chosen; obs[27] = 0
-            bet_phase=True,
-        )
+        obs[25] = float(np.clip(tc, -5.0, 5.0)) / 5.0
+        obs[26] = dr / 6.0
+        return obs
 
     def _play_phase_obs(self) -> tuple[np.ndarray, np.ndarray]:
         """Return (obs, mask) for the current active sub-hand."""
@@ -485,8 +503,6 @@ class BlackjackEnv:
             can_split=can_split,
             true_count=tc,
             decks_remaining=dr,
-            bet_multiplier=self._bet_multiplier,
-            bet_phase=False,
         )
         mask = compute_mask(
             can_hit=can_hit,

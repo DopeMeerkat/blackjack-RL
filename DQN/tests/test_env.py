@@ -2,7 +2,7 @@
 
 Acceptance criteria (from blackjack_rl_design.md §13, Milestone 1):
   1. Random/basic-strategy EV over 100K hands in [-1.5%, -0.4%].
-  2. obs.shape == (28,), mask.shape == (4,) at every decision point.
+  2. obs.shape == (27,), mask.shape == (4,) at every decision point.
   3. Hi-Lo count update on a hand-checked card sequence matches §15.2 exactly.
   4. Splits produce sub-hands whose summed reward is correctly returned.
 """
@@ -223,7 +223,7 @@ class TestDimensions:
         from env.blackjack import BlackjackEnv
         env = BlackjackEnv(CONFIG, seed=0)
         obs, mask, info = env.reset()
-        assert obs.shape == (28,), f"Expected obs shape (28,), got {obs.shape}"
+        assert obs.shape == (27,), f"Expected obs shape (27,), got {obs.shape}"
         assert obs.dtype == np.float32
         assert mask.shape == (4,), f"Expected mask shape (4,), got {mask.shape}"
         assert mask.dtype == bool
@@ -233,7 +233,7 @@ class TestDimensions:
         env = BlackjackEnv(CONFIG, seed=0)
         obs, mask, info = env.reset()
         obs2, mask2, reward, done, info2 = env.step(0)   # bet 1x
-        assert obs2.shape == (28,)
+        assert obs2.shape == (27,)
         assert obs2.dtype == np.float32
         assert mask2.shape == (4,)
         assert mask2.dtype == bool
@@ -243,19 +243,19 @@ class TestDimensions:
         from env.blackjack import BlackjackEnv
         env = BlackjackEnv(CONFIG, seed=1)
         obs, mask, info = env.reset()
-        assert obs.shape == (28,)
+        assert obs.shape == (27,)
         assert mask.shape == (4,)
 
         obs, mask, r, done, info = env.step(0)   # bet
         while not done:
-            assert obs.shape == (28,)
+            assert obs.shape == (27,)
             assert mask.shape == (4,)
             # Choose a legal action
             legal = np.where(mask)[0]
             action = int(legal[0])
             obs, mask, r, done, info = env.step(action)
 
-        assert obs.shape == (28,)
+        assert obs.shape == (27,)
         assert mask.shape == (4,)
 
     def test_bet_phase_obs_features_zeroed(self):
@@ -264,9 +264,8 @@ class TestDimensions:
         env = BlackjackEnv(CONFIG, seed=5)
         obs, mask, info = env.reset()
         assert info["phase"] == "bet"
-        # Indices 0, 1, 2-11, 12-24, 27 must be zero.
-        zeroed = list(range(0, 25)) + [27]
-        for i in zeroed:
+        # Indices 0-24 must be zero (play-state features).
+        for i in range(25):
             assert obs[i] == 0.0, f"obs[{i}] = {obs[i]}, expected 0.0 in bet phase"
         # obs[25] and obs[26] should be populated.
         # (At start of fresh shoe: 312 cards, DR=6, obs[26]=1.0; count=0, obs[25]=0.0)
@@ -737,7 +736,7 @@ class TestVecEnv:
         from env.vec_env import VecBlackjackEnv
         vec = VecBlackjackEnv(num_envs=64, config=CONFIG)
         obs, masks, infos = vec.reset()
-        assert obs.shape == (64, 28)
+        assert obs.shape == (64, 27)
         assert obs.dtype == np.float32
         assert masks.shape == (64, 4)
         assert masks.dtype == bool
@@ -750,7 +749,7 @@ class TestVecEnv:
         # All envs in bet phase: take action 0 (bet 1x)
         actions = np.zeros(64, dtype=int)
         obs2, masks2, rewards, dones, infos2 = vec.step(actions)
-        assert obs2.shape == (64, 28)
+        assert obs2.shape == (64, 27)
         assert masks2.shape == (64, 4)
         assert rewards.shape == (64,)
         assert rewards.dtype == np.float32
@@ -817,17 +816,3 @@ class TestEncoding:
                 legal = np.where(mask2)[0]
                 obs2, mask2, r, done, _ = env.step(int(legal[0]))
 
-    def test_bet_multiplier_normalised(self):
-        """obs[27] = bet_multiplier / 12 should equal exactly the right value."""
-        from env.blackjack import BlackjackEnv
-        mults = [1, 2, 4, 8, 12]
-        expected_norm = [m / 12.0 for m in mults]
-        for bet_idx, exp in enumerate(expected_norm):
-            shoe = np.array([2, 5, 3, 9] + [7] * 300, dtype=np.int8)
-            env = BlackjackEnv(CONFIG, shoe=shoe)
-            env.reset()
-            obs, mask, r, done, info = env.step(bet_idx)
-            if not done:
-                assert obs[27] == pytest.approx(exp), (
-                    f"bet_idx={bet_idx}: obs[27]={obs[27]}, expected {exp}"
-                )
